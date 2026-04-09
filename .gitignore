@@ -1,0 +1,21 @@
+# Python 编译缓存
+__pycache__/
+*.py[cod]
+
+# 虚拟环境
+venv/
+env/
+.env
+
+# 测试数据和日志 (保护测试者的声音隐私)
+data/profiles/*
+data/logs/*
+*.wav
+*.pcm
+*.mp3
+
+# 配置文件 (防止泄露 MQTT 密码和服务器 IP)
+config_secret.yaml
+
+# VSCode 配置文件
+.vscode/

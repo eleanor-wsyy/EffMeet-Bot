@@ -1,0 +1,6 @@
+paho-mqtt==1.6.1
+numpy>=1.21.0
+pydub==0.25.1
+pandas>=1.3.0
+openpyxl>=3.0.9
+# silero 和 modelscope 可以等部署环境时再安装，避免本地环境过重
