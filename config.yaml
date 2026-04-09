@@ -1,0 +1,14 @@
+# 网络通信配置
+mqtt:
+  broker: "broker.emqx.io"    # EMQX 免费公共测试服务器（开发初期用这个最省事）
+  port: 1883                  # 默认 TCP 端口
+  client_id: "EffMeet_Cloud_Core" # 你的云端专属身份证
+  # 订阅主题：接收来自4个麦克风的音频或状态 (使用通配符 # 接收所有麦克风)
+  topic_sub: "effmeet/device/audio/#" 
+  # 发布主题：给小车下发移动或干预指令
+  topic_pub: "effmeet/device/control/car"
+
+# 算法逻辑参数 (预留)
+logic:
+  variance_threshold: 15.0    # 方差触发阈值
+  cooldown_seconds: 180       # 引导动作冷却时间（秒）
