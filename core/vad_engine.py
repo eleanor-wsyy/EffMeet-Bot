@@ -31,13 +31,22 @@ class VADEngine:
             audio_float32 = audio_array.astype(np.float32) / 32768.0
             tensor = torch.from_numpy(audio_float32)
 
-            speech_prob = self.model(tensor, self.sample_rate).item()
+            # [关键修复]：Silero VAD 要求每次只能处理 512 个采样点
+            window_size = 512
             
-            if speech_prob > threshold:
-                print(f"  🗣️ [识别到人声] 概率: {speech_prob:.2f}")
-                return True
-            else:
-                return False
+            # 我们把 1 秒钟的声音，切成很多个 32 毫秒的小块，循环喂给模型
+            for i in range(0, len(tensor) - window_size, window_size):
+                chunk = tensor[i : i + window_size]
+                speech_prob = self.model(chunk, self.sample_rate).item()
+                
+                # 只要这 1 秒钟内，有任何一个 32 毫秒的小块被判定为人声，
+                # 我们就认为这整整 1 秒钟都有人在说话！
+                if speech_prob > threshold:
+                    print(f"  🗣️ [识别到人声] 触发时间戳: {i/16000:.2f}秒处")
+                    return True 
+                    
+            # 如果循环完了都没发现人声，那就是纯噪音/安静
+            return False
                 
         except Exception as e:
             print(f"[VAD] 音频推理出错: {e}")

@@ -1,70 +1,64 @@
 import paho.mqtt.client as mqtt
 import json
-from utils.audio_buffer import AudioStreamManager
 
 class MQTTManager:
-    def __init__(self, config, audio_stream_manager):
-        self.broker = config['mqtt']['broker']
-        self.port = config['mqtt']['port']
-        self.client_id = config['mqtt']['client_id']
-        self.topic_sub = config['mqtt']['topic_sub']
-        self.topic_pub = config['mqtt']['topic_pub']
+    def __init__(self, config, audio_stream=None):
+        self.config = config
+        self.audio_stream = audio_stream
         
-        # 挂载音频流水线拼接器
-        self.audio_stream = audio_stream_manager
+        # [修复] 完美适配你真实的 config.yaml 键名
+        self.topic_audio = config['mqtt']['topic_sub']
+        self.topic_pub = config['mqtt']['topic_control']
         
-        # 初始化客户端
-        self.client = mqtt.Client(self.client_id)
+        # 顺便把你配置里的专属身份证 client_id 也用上
+        client_id = config['mqtt'].get('client_id', 'EffMeet_Cloud_Core')
+        self.client = mqtt.Client(client_id=client_id)
         
-        # 绑定回调函数
         self.client.on_connect = self._on_connect
         self.client.on_message = self._on_message
-        self.client.on_disconnect = self._on_disconnect
+
+    def start(self):
+        print("[MQTT] 正在初始化通信链路...")
+        try:
+            self.client.connect(self.config['mqtt']['broker'], self.config['mqtt']['port'], 60)
+            self.client.loop_start()
+        except Exception as e:
+            print(f"[MQTT] 连接失败: {e}")
 
     def _on_connect(self, client, userdata, flags, rc):
         if rc == 0:
-            print(f"[MQTT] 成功连接到服务器: {self.broker}")
-            self.client.subscribe(self.topic_sub)
-            print(f"[MQTT] 已订阅主题: {self.topic_sub}")
+            print(f"✅ [MQTT] 成功连接服务器: {self.config['mqtt']['broker']}")
+            self.client.subscribe(self.topic_audio)
+            print(f"[MQTT] 已订阅监听主题: {self.topic_audio}")
         else:
-            print(f"[MQTT] 连接失败，错误码: {rc}")
+            print(f"❌ [MQTT] 连接异常，错误码: {rc}")
 
     def _on_message(self, client, userdata, msg):
+        """处理来自端侧的消息"""
         topic = msg.topic
         payload = msg.payload
         
-        # 提取设备ID (假设主题格式为 effmeet/device/audio/node1，切割后取最后的 node1)
         try:
+            # 提取设备 ID (例如从 effmeet/device/audio/node1 提取 node1)
             device_id = topic.split('/')[-1]
             
-            # 把收到的碎片数据直接扔进流水线拼接器
-            self.audio_stream.add_chunk(device_id, payload)
-            # 👇👇👇 [新增的临时物理外挂] 👇👇👇
-            # 只要收到 MQTT 消息，不管是不是人声，强行给这个人加 20 秒发言时间！
-            self.audio_stream.meeting_state.add_speech_time(device_id, 20.0)  # 直接加上
-            # 👆👆👆-------------------------👆👆👆
-            
-            # 为了调试不刷屏，这里暂时屏蔽了每次收到碎片的打印
-            print(f"[MQTT接收] {device_id} 发来 {len(payload)} 字节")
-            
+            if self.audio_stream:
+                self.audio_stream.add_chunk(device_id, payload)
+                
         except Exception as e:
-            print(f"[MQTT] 解析数据包错误: {e}")
+            print(f"[MQTT] 消息处理错误: {e}")
 
-    def _on_disconnect(self, client, userdata, rc):
-        print("[MQTT] 已断开连接，尝试重连...")
-
-    def start(self):
-        """启动 MQTT 监听线程"""
-        print("[MQTT] 正在初始化通信链路...")
-        self.client.connect(self.broker, self.port, 60)
-        self.client.loop_start() 
-
-    def send_command(self, action, target_color):
-        """给小车发送控制指令"""
+    def send_command(self, action, target_node):
+        """
+        下发控制指令给小车
+        action: 指令类型，如 "move"
+        target_node: 目标节点 ID，如 "node1"
+        """
         command = {
-            "action": action,         
-            "target": target_color    
+            "action": action,
+            "target": target_node  # NFC 识别模式下，直接下发 ID
         }
+        
         payload = json.dumps(command)
         self.client.publish(self.topic_pub, payload)
-        print(f"[MQTT指令下发] {payload} -> {self.topic_pub}")
+        print(f"🚀 [MQTT指令下发] {payload} -> {self.topic_pub}")
