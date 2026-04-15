@@ -5,92 +5,53 @@ import queue
 import threading
 from core.vad_engine import VADEngine
 
-# ================= 配置区 =================
+# ================= 终极配置区 =================
 SAMPLE_RATE = 16000
 CHUNK_DURATION = 0.5
-BASE_NOISE_FLOOR = 200  
-# 物理搓麦克风的音量阈值（搓海绵的声音极大，通常在 1000~5000 之间）
-CALIBRATION_THRESHOLD = 1500 
+# 基础分贝门限：过滤掉没说话时的环境白噪音（通常环境底噪在 30~50dB 左右）
+BASE_DB_FLOOR = 45.0  
 # ==========================================
 
-def interactive_calibration():
-    """硬核向导：通过物理搓动声音，让麦克风自己报名！"""
-    print("\n🔍 正在搜索系统的 AB13X 麦克风...")
-    raw_mics = []
-    
-    # 1. 盲抓 4 个 AB13X 麦克风的底层 ID
-    for i, dev in enumerate(sd.query_devices()):
-        if "AB13X" in dev['name'] and dev['max_input_channels'] > 0:
-            hostapi_name = sd.query_hostapis(dev['hostapi'])['name']
-            if "DirectSound" in hostapi_name:
-                raw_mics.append(i)
-                
-    if len(raw_mics) < 4:
-        print(f"❌ 警告：只找到了 {len(raw_mics)} 个麦克风！请确保 4 个麦克风都插好了。")
-        return None
+def get_decibels(audio_bytes):
+    """将声音字节流转换为人类直觉的 分贝(dB) 值"""
+    audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
+    # 计算均方根能量 (RMS)
+    rms = np.sqrt(np.mean(audio_array.astype(np.float32)**2))
+    # 转换为分贝 (加 1e-6 防止 log(0) 报错)
+    db = 20 * np.log10(rms + 1e-6)
+    return db
 
-    print(f"✅ 成功找到 4 个麦克风！进入【物理座位绑定向导】...")
+def find_renamed_microphones():
+    """精确寻址：直接去抓取我们在 Windows 里改好的专属名字"""
+    print("🔍 正在扫描系统底层的专属麦克风...")
+    target_mics = {}
+    expected_names = ["NODE1_MIC", "NODE2_MIC", "NODE3_MIC", "NODE4_MIC"]
     
-    # 2. 开启 4 个临时监听流用于感知敲击
-    calib_queues = {mid: queue.Queue() for mid in raw_mics}
-    streams = []
-    
-    for mid in raw_mics:
-        def cb(indata, frames, time_info, status, m=mid):
-            calib_queues[m].put(indata.copy().tobytes())
-        s = sd.InputStream(device=mid, channels=1, samplerate=SAMPLE_RATE, dtype='int16', callback=cb)
-        s.start()
-        streams.append(s)
-
-    mapping = {}
-    nodes = ["node1", "node2", "node3", "node4"]
-    
-    # 3. 挨个要求用户去摸麦克风
-    for node in nodes:
-        print(f"\n👉 请用手指【用力搓一下】放在 {node} 座位上的麦克风海绵！")
-        found = False
-        while not found:
-            for mid in raw_mics:
-                if mid in mapping.values(): 
-                    continue # 这个麦克风已经认主了，跳过
-                
-                if not calib_queues[mid].empty():
-                    data = calib_queues[mid].get()
-                    arr = np.frombuffer(data, dtype=np.int16)
-                    rms = np.sqrt(np.mean(arr.astype(np.float32)**2))
-                    
-                    # 如果音量巨大，说明被人搓了！
-                    if rms > CALIBRATION_THRESHOLD:
-                        print(f"  🔒 标定成功！{node} 已死死绑定到底层麦克风 (音量: {int(rms)})")
-                        mapping[node] = mid
-                        found = True
+    devices = sd.query_devices()
+    for i, dev in enumerate(devices):
+        # 匹配我们刚才在系统里改的名字（忽略大小写）
+        dev_name_upper = dev['name'].upper()
+        for expected in expected_names:
+            if expected in dev_name_upper and dev['max_input_channels'] > 0:
+                hostapi_name = sd.query_hostapis(dev['hostapi'])['name']
+                # 优先选用兼容性最强的 MME 或 DirectSound
+                if "MME" in hostapi_name or "DirectSound" in hostapi_name:
+                    node_key = expected.split('_')[0].lower() # 提取 node1, node2...
+                    if node_key not in target_mics:
+                        target_mics[node_key] = i
+                        print(f"  🔒 物理锁定成功: [{node_key}] -> {dev['name']} (底层ID: {i})")
                         
-                        # 清空所有队列，防止一次搓动触发两次绑定
-                        for q in calib_queues.values():
-                            while not q.empty(): q.get()
-                        
-                        time.sleep(1) # 缓冲1秒，等你把手拿开
-                        break
-            time.sleep(0.01)
+    return target_mics
 
-    # 4. 标定结束，关掉临时流
-    for s in streams:
-        s.stop()
-        s.close()
-        
-    print("\n🎉 物理标定全部完成！这 4 个席位现在绝对不会弄错了！")
-    return mapping
+# 1. 抓取麦克风
+MICROPHONES = find_renamed_microphones()
 
-# ==========================================
-# 1. 启动安装向导
-MICROPHONES = interactive_calibration()
-
-if not MICROPHONES:
-    print("系统强制拦截启动！")
+if len(MICROPHONES) < 4:
+    print("\n❌ 警告：未找齐 4 个专属麦克风！")
+    print("请确认是否已在 Windows 声音控制面板中将它们重命名为 NODE1_MIC 到 NODE4_MIC。")
     exit()
 
-# 2. 正式启动大脑
-print("\n=== 🚀 启动四路并发收音与【赢家通吃】AI 大脑 ===")
+print("\n=== 🚀 启动四路并发收音与【分贝争夺战】AI 大脑 ===")
 vad_engine = VADEngine(sample_rate=SAMPLE_RATE)
 
 audio_queues = {node: queue.Queue() for node in MICROPHONES.keys()}
@@ -102,29 +63,29 @@ def make_callback(node_name):
     return callback
 
 def brain_worker():
-    print("🧠 [云端大脑] 监听中，请开始你们的会议...\n")
+    print("🧠 [云端大脑] 监听中，将以【最高分贝】作为唯一发言依据...\n")
     while True:
-        all_ready = all(not q.empty() for q in audio_queues.values())
-        
-        if all_ready:
+        # 等待 4 个麦克风齐步走
+        if all(not q.empty() for q in audio_queues.values()):
             chunks = {}
-            rms_values = {}
+            db_values = {}
             
+            # 取出数据并计算分贝
             for node_name, q in audio_queues.items():
                 audio_bytes = q.get()
                 chunks[node_name] = audio_bytes
-                
-                audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
-                rms_volume = np.sqrt(np.mean(audio_array.astype(np.float32)**2))
-                rms_values[node_name] = rms_volume
+                db_values[node_name] = get_decibels(audio_bytes)
             
-            winner_node = max(rms_values, key=rms_values.get)
-            max_rms = rms_values[winner_node]
+            # 【分贝争夺战核心】：找出分贝最高的那个人！
+            winner_node = max(db_values, key=db_values.get)
+            max_db = db_values[winner_node]
             
-            if max_rms > BASE_NOISE_FLOOR:
+            # 1. 最高分贝必须大于环境底噪（说明真有人在说话，不是空气声）
+            if max_db > BASE_DB_FLOOR:
+                # 2. 最高分贝的那个音频，送给 AI 去验证是不是人话（排除敲桌子、咳嗽）
                 if vad_engine.is_speech(chunks[winner_node], threshold=0.5):
                     speaking_times[winner_node] += CHUNK_DURATION
-                    print(f"👑 [精准识别] {winner_node} 发言! (音量:{int(max_rms)}) | 累计:{speaking_times[winner_node]:.1f}秒")
+                    print(f"🎤 [有效发言] {winner_node} 胜出! (分贝:{max_db:.1f}dB) | 累计时长:{speaking_times[winner_node]:.1f}秒")
         else:
             time.sleep(0.01)
 
@@ -152,7 +113,7 @@ def run_multi_test():
             stream.stop()
             stream.close()
         
-        print("\n📊 === 最终会议发言时长精准统计 === 📊")
+        print("\n📊 === 最终会议发言时长精确统计 === 📊")
         for node, duration in speaking_times.items():
             print(f" - {node} 席位: {duration:.1f} 秒")
 
