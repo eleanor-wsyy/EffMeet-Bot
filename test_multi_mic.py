@@ -1,3 +1,4 @@
+from flask import Flask, jsonify
 import sounddevice as sd
 import numpy as np
 import time
@@ -5,19 +6,24 @@ import queue
 import threading
 from core.vad_engine import VADEngine
 
-# ================= 终极配置区 =================
+# ================= Flask 接口配置区 =================
+app = Flask(__name__)
+
+# 会议内容记录本：存每个人在什么时间说话
+meeting_records = []
+# ==================================================
+
+# ================= 音频硬件配置区 =================
 SAMPLE_RATE = 16000
 CHUNK_DURATION = 0.5
 # 基础分贝门限：过滤掉没说话时的环境白噪音（通常环境底噪在 30~50dB 左右）
 BASE_DB_FLOOR = 45.0  
-# ==========================================
+# ==================================================
 
 def get_decibels(audio_bytes):
     """将声音字节流转换为人类直觉的 分贝(dB) 值"""
     audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
-    # 计算均方根能量 (RMS)
     rms = np.sqrt(np.mean(audio_array.astype(np.float32)**2))
-    # 转换为分贝 (加 1e-6 防止 log(0) 报错)
     db = 20 * np.log10(rms + 1e-6)
     return db
 
@@ -29,12 +35,10 @@ def find_renamed_microphones():
     
     devices = sd.query_devices()
     for i, dev in enumerate(devices):
-        # 匹配我们刚才在系统里改的名字（忽略大小写）
         dev_name_upper = dev['name'].upper()
         for expected in expected_names:
             if expected in dev_name_upper and dev['max_input_channels'] > 0:
                 hostapi_name = sd.query_hostapis(dev['hostapi'])['name']
-                # 优先选用兼容性最强的 MME 或 DirectSound
                 if "MME" in hostapi_name or "DirectSound" in hostapi_name:
                     node_key = expected.split('_')[0].lower() # 提取 node1, node2...
                     if node_key not in target_mics:
@@ -65,36 +69,71 @@ def make_callback(node_name):
 def brain_worker():
     print("🧠 [云端大脑] 监听中，将以【最高分贝】作为唯一发言依据...\n")
     while True:
-        # 等待 4 个麦克风齐步走
         if all(not q.empty() for q in audio_queues.values()):
             chunks = {}
             db_values = {}
             
-            # 取出数据并计算分贝
             for node_name, q in audio_queues.items():
                 audio_bytes = q.get()
                 chunks[node_name] = audio_bytes
                 db_values[node_name] = get_decibels(audio_bytes)
             
-            # 【分贝争夺战核心】：找出分贝最高的那个人！
+            # 找出分贝最高的那个人
             winner_node = max(db_values, key=db_values.get)
             max_db = db_values[winner_node]
             
-            # 1. 最高分贝必须大于环境底噪（说明真有人在说话，不是空气声）
+            # 最高分贝必须大于环境底噪
             if max_db > BASE_DB_FLOOR:
-                # 2. 最高分贝的那个音频，送给 AI 去验证是不是人话（排除敲桌子、咳嗽）
+                # 验证是否为人声
                 if vad_engine.is_speech(chunks[winner_node], threshold=0.5):
                     speaking_times[winner_node] += CHUNK_DURATION
-                    print(f"🎤 [有效发言] {winner_node} 胜出! (分贝:{max_db:.1f}dB) | 累计时长:{speaking_times[winner_node]:.1f}秒")
+                    print(f"🎤 [有效发言] {winner_node} 胜出! (分贝:{max_db:.1f}dB) | 累计:{speaking_times[winner_node]:.1f}秒")
+                    
+                    # 【核心更新】：把发言动作记入账本，供队友的 API 调用
+                    record = {
+                        "node": winner_node,
+                        "time": time.strftime("%H:%M:%S", time.localtime()),
+                        "decibel": round(max_db, 1),
+                        "status": "speaking"
+                    }
+                    meeting_records.append(record)
         else:
             time.sleep(0.01)
+
+# ================= API 接口路由 =================
+@app.route('/api/get_meeting_data', methods=['GET'])
+def get_meeting_data():
+    """队友通过访问这个接口，就能拿到最新的会议记录和时长数据"""
+    response_data = {
+        "status": "success",
+        "current_speaking_times": speaking_times,
+        "latest_records": meeting_records[-10:]   # 只返回最近 10 条，防止数据拥堵
+    }
+    return jsonify(response_data)
+
+def start_api_server():
+    """启动 Flask 接口服务器"""
+    # 强制关掉 Flask 自带的啰嗦日志，保持终端清爽
+    import logging
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
+    
+    print("🌐 [API 接口] 已启动！请让队友 GET 访问：http://你的电脑IP:5000/api/get_meeting_data")
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+# ===============================================
 
 def run_multi_test():
     streams = []
     try:
+        # 1. 启动接口线程
+        api_thread = threading.Thread(target=start_api_server, daemon=True)
+        api_thread.start()
+
+        # 2. 启动云端大脑线程
         brain_thread = threading.Thread(target=brain_worker, daemon=True)
         brain_thread.start()
 
+        # 3. 启动麦克风监听流
         for node_name, device_id in MICROPHONES.items():
             stream = sd.InputStream(
                 device=device_id, channels=1, samplerate=SAMPLE_RATE,
@@ -104,6 +143,7 @@ def run_multi_test():
             stream.start()
             streams.append(stream)
 
+        # 挂起主线程
         while True:
             time.sleep(1)
 
