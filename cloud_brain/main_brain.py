@@ -1,3 +1,7 @@
+# -*- coding: utf-8 -*-
+import sys, io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+
 import sounddevice as sd
 import numpy as np
 import time
@@ -11,46 +15,45 @@ from flask import Flask, jsonify
 from faster_whisper import WhisperModel
 from core.vad_engine import VADEngine
 
-# ================= 1. 终极配置区 =================
-# 音频与系统配置
-SAMPLE_RATE = 16000
+# ================= 1. 配置区 =================
+SAMPLE_RATE    = 16000
 CHUNK_DURATION = 0.5
-BASE_DB_FLOOR = 45.0  
+BASE_DB_FLOOR  = 45.0
 
-# MQTT 配置 (负责叫小车)
-MQTT_BROKER        = "broker.emqx.io"
-MQTT_PORT          = 1883
-MQTT_TOPIC_CONTROL = "esp32s3/control"     # → 发给机器人的指令
-MQTT_TOPIC_STATUS  = "esp32s3/status"      # ← 机器人完成后回复
-MQTT_TOPIC_CYCLE_DONE = "effmeet/cycle/done"  # → 一整圈干预完毕通知
-SILENCE_TIMEOUT    = 120  # 每 120 秒检查一次是否需要干预
+# MQTT
+MQTT_BROKER           = "broker.emqx.io"
+MQTT_PORT             = 1883
+MQTT_TOPIC_CONTROL    = "esp32s3/control"      # -> 发给机器人
+MQTT_TOPIC_STATUS     = "esp32s3/status"       # <- 机器人完成回复
+MQTT_TOPIC_CYCLE_DONE = "effmeet/cycle/done"   # -> 一整圈干预完毕通知
+SILENCE_TIMEOUT       = 120  # 每 120 秒检查一次是否需要干预
 
-# 干预顺序：逆时针 1(上)→2(左)→3(下)→4(右)，可修改数字但保持逆时针
+# 干预顺序：逆时针 1(上)->2(左)->3(下)->4(右)，可改数字但保持逆时针
 INTERVENTION_ORDER = [1, 2, 3, 4]
 
-# 物理座位绑定表 (请替换成你在控制面板改好的名字)
+# 物理座位绑定表（必须与声音设置里的名字一致）
 NODE_HARDWARE_MAP = ["NODE1_MIC", "NODE2_MIC", "NODE3_MIC", "NODE4_MIC"]
-# ===============================================
+# ==============================================
 
-# ================= 2. 全局状态与接口 =================
+# ================= 2. 全局状态 =================
 app = Flask(__name__)
-meeting_records = []  # 存转写好的文字记录
-speaking_times = {f"node{i}": 0.0 for i in range(1, 5)}
+meeting_records = []
+speaking_times  = {f"node{i}": 0.0 for i in range(1, 5)}
 
 # 机器人调度状态
-_robot_busy   = False       # 机器人正在执行任务时为 True
-_cycle_index  = 0           # 当前轮到第几个人（0~3）
-_cycle_lock   = threading.Lock()
-_mqtt_client_ref = None     # MQTT 客户端引用，供回调使用
+_robot_busy      = False
+_cycle_index     = 0
+_active_targets  = []          # 本轮需要干预的目标列表（动态生成）
+_cycle_lock      = threading.Lock()
+_mqtt_client_ref = None
 
-# 初始化 Whisper 模型 (选 tiny 最快，跑在 CPU 上保证不报错)
-print("⏳ 正在加载 Whisper 本地语音大模型，请稍候...")
+# Whisper 模型加载
+print("[BOOT] 正在加载 Whisper 模型，请稍候...")
 whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
-print("✅ Whisper 模型加载完毕！")
+print("[BOOT] Whisper 模型加载完毕！")
 
-# 音频缓冲系统 (用于把碎片段拼成一整句话)
-audio_queues = {f"node{i}": queue.Queue() for i in range(1, 5)}
-transcribe_queue = queue.Queue() # 等待转文字的任务队列
+audio_queues     = {f"node{i}": queue.Queue() for i in range(1, 5)}
+transcribe_queue = queue.Queue()
 
 @app.route('/api/get_meeting_data', methods=['GET'])
 def get_meeting_data():
@@ -59,19 +62,18 @@ def get_meeting_data():
         "current_speaking_times": speaking_times,
         "latest_records": meeting_records[-10:]
     })
-# ===============================================
+# ==============================================
 
-# ================= 3. 核心工具函数 =================
+# ================= 3. 工具函数 =================
 def get_decibels(audio_bytes):
     arr = np.frombuffer(audio_bytes, dtype=np.int16)
     rms = np.sqrt(np.mean(arr.astype(np.float32)**2))
     return 20 * np.log10(rms + 1e-6)
 
 def save_to_wav(audio_frames, filename):
-    """把字节流存成临时的 wav 文件供 Whisper 读取"""
     with wave.open(filename, 'wb') as wf:
         wf.setnchannels(1)
-        wf.setsampwidth(2) # 16-bit
+        wf.setsampwidth(2)
         wf.setframerate(SAMPLE_RATE)
         wf.writeframes(b''.join(audio_frames))
 
@@ -87,69 +89,59 @@ def find_renamed_microphones():
                     if node_key not in target_mics:
                         target_mics[node_key] = i
     return target_mics
-# ===============================================
+# ==============================================
 
-# ================= 4. 各大运转线程 =================
+# ================= 4. 线程 =================
 
 def whisper_worker():
-    """专门负责把声音文件转成文字的线程"""
+    """把音频帧转成文字"""
     if not os.path.exists("temp_audio"):
         os.makedirs("temp_audio")
-        
     while True:
-        task = transcribe_queue.get() # task = (node_name, audio_frames, max_db)
-        node_name, frames, max_db = task
-        
-        # 1. 存临时文件
+        node_name, frames, max_db = transcribe_queue.get()
         temp_file = f"temp_audio/{node_name}_{int(time.time())}.wav"
         save_to_wav(frames, temp_file)
-        
-        # 2. 调用大模型转写
         segments, info = whisper_model.transcribe(temp_file, beam_size=5)
-        text = "".join([segment.text for segment in segments]).strip()
-        
-        # 3. 如果真说出了话，记入全局账本供队友调用
+        text = "".join([seg.text for seg in segments]).strip()
         if text:
-            print(f"📝 [{node_name} 转写成功]: {text}")
+            print(f"[TRANSCRIBE] {node_name}: {text}")
             meeting_records.append({
                 "node": node_name,
                 "time": time.strftime("%H:%M:%S"),
                 "text": text,
                 "decibel": round(max_db, 1)
             })
-            
-        # 打扫战场
         try: os.remove(temp_file)
         except: pass
 
+
 def _send_next_intervention(client):
-    """发送当前序列里下一个干预目标给机器人（内部工具函数）"""
-    global _robot_busy, _cycle_index
-    target = INTERVENTION_ORDER[_cycle_index]
+    """发送当前序列里的干预目标给机器人"""
+    target = _active_targets[_cycle_index]
     client.publish(MQTT_TOPIC_CONTROL, str(target))
-    print(f"🚗 [调度] 发送干预目标 → {target} 号位 （第 {_cycle_index + 1}/{len(INTERVENTION_ORDER)} 个）")
+    print(f"[SEND] -> esp32s3/control : '{target}'  ({_cycle_index + 1}/{len(_active_targets)})")
+    sys.stdout.flush()
 
 
 def _on_robot_done(client, msg_payload):
-    """收到机器人 done 消息后的处理逻辑"""
+    """收到机器人 done 消息后推进序列"""
     global _robot_busy, _cycle_index
-    print(f"✅ [机器人] 收到完成消息: {msg_payload}")
-
+    print(f"[RECV] <- esp32s3/status : '{msg_payload}'")
     with _cycle_lock:
         _cycle_index += 1
-        if _cycle_index >= len(INTERVENTION_ORDER):
-            # ── 一整圈干预完毕 ──
+        if _cycle_index >= len(_active_targets):
             _cycle_index = 0
-            _robot_busy = False
+            _robot_busy  = False
             client.publish(MQTT_TOPIC_CYCLE_DONE, "cycle_done")
-            print("🎉 [干预] 本轮完整循环结束！已发送 cycle_done 通知，等待下一轮触发。")
+            print("[DONE] 本轮干预结束！已发布 effmeet/cycle/done : 'cycle_done'")
         else:
-            # ── 还有下一个人，继续派车（排队一个一个来）──
+            print(f"[NEXT] 收到完成，发送下一个...")
             _send_next_intervention(client)
+    sys.stdout.flush()
 
 
 def mqtt_monitor_worker():
-    """机器人调度线程：顺序发送 1→2→3→4，每次等 done 再发下一个"""
+    """机器人调度线程：顺序发 1->2->3->4，每次等 done 再发下一个"""
     global _robot_busy, _cycle_index, _mqtt_client_ref
 
     client_id = "EffMeet_Brain_" + str(random.randint(0, 9999))
@@ -159,9 +151,10 @@ def mqtt_monitor_worker():
     def on_connect(c, userdata, flags, rc):
         if rc == 0:
             c.subscribe(MQTT_TOPIC_STATUS)
-            print(f"📡 [MQTT] 已连接，订阅机器人状态主题: {MQTT_TOPIC_STATUS}")
+            print(f"[MQTT] 已连接，订阅: {MQTT_TOPIC_STATUS}")
         else:
-            print(f"❌ [MQTT] 连接失败，错误码: {rc}")
+            print(f"[MQTT] 连接失败 rc={rc}")
+        sys.stdout.flush()
 
     def on_message(c, userdata, msg):
         payload = msg.payload.decode("utf-8", errors="ignore").strip()
@@ -173,110 +166,117 @@ def mqtt_monitor_worker():
 
     try:
         client.connect(MQTT_BROKER, MQTT_PORT, 60)
-        client.loop_start()  # 后台线程处理接收
-        print(f"📡 [MQTT] 机器人调度系统上线！")
+        client.loop_start()
+        print("[MQTT] 机器人调度系统上线！")
     except Exception as e:
-        print(f"⚠️ [MQTT] 连接失败，请检查网络: {e}")
+        print(f"[MQTT] 连接失败: {e}")
         return
 
     while True:
         time.sleep(SILENCE_TIMEOUT)
         with _cycle_lock:
             if _robot_busy:
-                print("[调度] 机器人忙碌中，跳过本次检查，排队等待...")
+                print("[SCHED] 机器人忙碌中，等待...")
                 continue
-            # 检查是否需要干预（发言时长失衡）
             total = sum(speaking_times.values())
-            if total > 5:   # 会议总时长 > 5 秒才评判
+            if total > 5:
                 avg_time = total / 4.0
-                most_silent = min(speaking_times, key=speaking_times.get)
-                if speaking_times[most_silent] < (avg_time * 0.5):
-                    # 触发！从第 0 个人开始顺序干预
+                # 找出所有发言时间不足平均50%的节点，按发言量从少到多排序
+                silent_nodes = sorted(
+                    [n for n in speaking_times if speaking_times[n] < avg_time * 0.5],
+                    key=lambda n: speaking_times[n]
+                )
+                if silent_nodes:
+                    _active_targets[:] = [int(n.replace("node", "")) for n in silent_nodes]
                     _cycle_index = 0
-                    _robot_busy = True
-                    print(f"⚠️ [触发干预] {most_silent} 发言严重偏少，开始新一轮顺序干预...")
+                    _robot_busy  = True
+                    print(f"[TRIGGER] 发言偏少节点（按发言量从少到多）: {silent_nodes}")
+                    print(f"[TRIGGER] 本轮干预目标: {_active_targets}")
                     _send_next_intervention(client)
+                else:
+                    print("[SCHED] 发言分布均衡，无需干预")
+        sys.stdout.flush()
+
 
 def brain_worker():
-    """实时监听、断句、算分贝的主大脑"""
+    """实时监听、断句、算分贝"""
     vad_engine = VADEngine(sample_rate=SAMPLE_RATE)
-    
-    current_speaker = None
-    audio_buffer = []
-    silence_ticks = 0
+    current_speaker    = None
+    audio_buffer       = []
+    silence_ticks      = 0
     max_db_in_sentence = 0
 
-    print("🧠 [云端大脑] 监听与录音系统启动...")
+    print("[BRAIN] 监听与录音系统启动...")
     while True:
         if all(not q.empty() for q in audio_queues.values()):
-            chunks = {n: q.get() for n, q in audio_queues.items()}
-            db_values = {n: get_decibels(chunks[n]) for n in audio_queues.keys()}
-            
+            chunks   = {n: q.get() for n, q in audio_queues.items()}
+            db_values = {n: get_decibels(chunks[n]) for n in audio_queues}
             winner_node = max(db_values, key=db_values.get)
-            max_db = db_values[winner_node]
-            
+            max_db      = db_values[winner_node]
+
             is_speaking = False
             if max_db > BASE_DB_FLOOR and vad_engine.is_speech(chunks[winner_node]):
                 is_speaking = True
                 speaking_times[winner_node] += CHUNK_DURATION
-                
-            # --- 断句与录音逻辑（状态机） ---
+
             if is_speaking:
                 if current_speaker != winner_node:
-                    # 换人说话了！把上一个人的录音结算掉，送去转文字
                     if current_speaker and len(audio_buffer) > 1:
                         transcribe_queue.put((current_speaker, audio_buffer, max_db_in_sentence))
-                    # 开启新的人的录音
-                    current_speaker = winner_node
-                    audio_buffer = [chunks[winner_node]]
+                    current_speaker    = winner_node
+                    audio_buffer       = [chunks[winner_node]]
                     max_db_in_sentence = max_db
                 else:
-                    # 还是这个人，继续录
                     audio_buffer.append(chunks[winner_node])
                     max_db_in_sentence = max(max_db_in_sentence, max_db)
                 silence_ticks = 0
             else:
-                # 没人说话，增加沉默倒计时
                 silence_ticks += 1
-                # 如果连续安静了超过 1.5 秒 (3个tick)，就把刚才录的结算掉
                 if silence_ticks > 3 and current_speaker is not None:
                     if len(audio_buffer) > 1:
                         transcribe_queue.put((current_speaker, audio_buffer, max_db_in_sentence))
                     current_speaker = None
-                    audio_buffer = []
+                    audio_buffer    = []
         else:
             time.sleep(0.01)
 
-# ================= 5. 主程序启动 =================
+# ================= 5. 主程序 =================
 def main():
     MICROPHONES = find_renamed_microphones()
+    print(f"[BOOT] 检测到麦克风: {list(MICROPHONES.keys())}")
     if len(MICROPHONES) < 4:
-        print("\n❌ 物理麦克风未就绪，强制退出。")
+        print(f"[ERROR] 只找到 {len(MICROPHONES)} 个麦克风，需要 4 个，退出。")
+        print("        请在 Windows 声音设置里把 4 个麦克风分别改名为：")
+        print("        NODE1_MIC / NODE2_MIC / NODE3_MIC / NODE4_MIC")
         return
 
-    # 启动 API 接口
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False), daemon=True).start()
-    # 启动文字转写处理
-    threading.Thread(target=whisper_worker, daemon=True).start()
-    # 启动小车调度
+    threading.Thread(target=whisper_worker,    daemon=True).start()
     threading.Thread(target=mqtt_monitor_worker, daemon=True).start()
-    # 启动大脑核心
-    threading.Thread(target=brain_worker, daemon=True).start()
+    threading.Thread(target=brain_worker,      daemon=True).start()
 
-    # 启动硬件监听
     streams = []
     for n, i in MICROPHONES.items():
         def cb(indata, frames, time_info, status, name=n):
             audio_queues[name].put(indata.copy().tobytes())
-        s = sd.InputStream(device=i, channels=1, samplerate=SAMPLE_RATE, dtype='int16', blocksize=int(SAMPLE_RATE*CHUNK_DURATION), callback=cb)
+        s = sd.InputStream(device=i, channels=1, samplerate=SAMPLE_RATE,
+                           dtype='int16', blocksize=int(SAMPLE_RATE*CHUNK_DURATION), callback=cb)
         s.start()
         streams.append(s)
+        print(f"[MIC] {n} 麦克风启动 (device={i})")
+
+    print("\n[READY] 系统全部就绪！等待发言数据...")
+    print(f"        干预触发：每 {SILENCE_TIMEOUT}s 检查，失衡则按序派车 1->2->3->4")
+    print("        按 Ctrl+C 退出\n")
+    sys.stdout.flush()
 
     try:
-        while True: time.sleep(1)
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
-        for s in streams: s.stop(); s.close()
-        print("\n📊 退出系统...")
+        for s in streams:
+            s.stop(); s.close()
+        print("\n[EXIT] 退出系统")
 
 if __name__ == "__main__":
     main()
