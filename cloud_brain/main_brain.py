@@ -5,7 +5,7 @@ import queue
 import threading
 import wave
 import os
-import json
+import random
 import paho.mqtt.client as mqtt
 from flask import Flask, jsonify
 from faster_whisper import WhisperModel
@@ -18,10 +18,15 @@ CHUNK_DURATION = 0.5
 BASE_DB_FLOOR = 45.0  
 
 # MQTT 配置 (负责叫小车)
-MQTT_BROKER = "broker.emqx.io"
-MQTT_PORT = 1883
-MQTT_TOPIC = "GAFA_Robot_Project_2026"
-SILENCE_TIMEOUT = 120  # 每 120 秒检查一次有没有人被冷落
+MQTT_BROKER        = "broker.emqx.io"
+MQTT_PORT          = 1883
+MQTT_TOPIC_CONTROL = "esp32s3/control"     # → 发给机器人的指令
+MQTT_TOPIC_STATUS  = "esp32s3/status"      # ← 机器人完成后回复
+MQTT_TOPIC_CYCLE_DONE = "effmeet/cycle/done"  # → 一整圈干预完毕通知
+SILENCE_TIMEOUT    = 120  # 每 120 秒检查一次是否需要干预
+
+# 干预顺序：逆时针 1(上)→2(左)→3(下)→4(右)，可修改数字但保持逆时针
+INTERVENTION_ORDER = [1, 2, 3, 4]
 
 # 物理座位绑定表 (请替换成你在控制面板改好的名字)
 NODE_HARDWARE_MAP = ["NODE1_MIC", "NODE2_MIC", "NODE3_MIC", "NODE4_MIC"]
@@ -31,6 +36,12 @@ NODE_HARDWARE_MAP = ["NODE1_MIC", "NODE2_MIC", "NODE3_MIC", "NODE4_MIC"]
 app = Flask(__name__)
 meeting_records = []  # 存转写好的文字记录
 speaking_times = {f"node{i}": 0.0 for i in range(1, 5)}
+
+# 机器人调度状态
+_robot_busy   = False       # 机器人正在执行任务时为 True
+_cycle_index  = 0           # 当前轮到第几个人（0~3）
+_cycle_lock   = threading.Lock()
+_mqtt_client_ref = None     # MQTT 客户端引用，供回调使用
 
 # 初始化 Whisper 模型 (选 tiny 最快，跑在 CPU 上保证不报错)
 print("⏳ 正在加载 Whisper 本地语音大模型，请稍候...")
@@ -111,32 +122,80 @@ def whisper_worker():
         try: os.remove(temp_file)
         except: pass
 
+def _send_next_intervention(client):
+    """发送当前序列里下一个干预目标给机器人（内部工具函数）"""
+    global _robot_busy, _cycle_index
+    target = INTERVENTION_ORDER[_cycle_index]
+    client.publish(MQTT_TOPIC_CONTROL, str(target))
+    print(f"🚗 [调度] 发送干预目标 → {target} 号位 （第 {_cycle_index + 1}/{len(INTERVENTION_ORDER)} 个）")
+
+
+def _on_robot_done(client, msg_payload):
+    """收到机器人 done 消息后的处理逻辑"""
+    global _robot_busy, _cycle_index
+    print(f"✅ [机器人] 收到完成消息: {msg_payload}")
+
+    with _cycle_lock:
+        _cycle_index += 1
+        if _cycle_index >= len(INTERVENTION_ORDER):
+            # ── 一整圈干预完毕 ──
+            _cycle_index = 0
+            _robot_busy = False
+            client.publish(MQTT_TOPIC_CYCLE_DONE, "cycle_done")
+            print("🎉 [干预] 本轮完整循环结束！已发送 cycle_done 通知，等待下一轮触发。")
+        else:
+            # ── 还有下一个人，继续派车（排队一个一个来）──
+            _send_next_intervention(client)
+
+
 def mqtt_monitor_worker():
-    """专门盯着时长，谁被冷落了就叫小车去哪"""
-    client = mqtt.Client()
+    """机器人调度线程：顺序发送 1→2→3→4，每次等 done 再发下一个"""
+    global _robot_busy, _cycle_index, _mqtt_client_ref
+
+    client_id = "EffMeet_Brain_" + str(random.randint(0, 9999))
+    client = mqtt.Client(client_id=client_id)
+    _mqtt_client_ref = client
+
+    def on_connect(c, userdata, flags, rc):
+        if rc == 0:
+            c.subscribe(MQTT_TOPIC_STATUS)
+            print(f"📡 [MQTT] 已连接，订阅机器人状态主题: {MQTT_TOPIC_STATUS}")
+        else:
+            print(f"❌ [MQTT] 连接失败，错误码: {rc}")
+
+    def on_message(c, userdata, msg):
+        payload = msg.payload.decode("utf-8", errors="ignore").strip()
+        if payload.startswith("done"):
+            _on_robot_done(c, payload)
+
+    client.on_connect = on_connect
+    client.on_message = on_message
+
     try:
         client.connect(MQTT_BROKER, MQTT_PORT, 60)
-        print(f"📡 [MQTT] 成功连接至 {MQTT_BROKER}，小车调度系统上线！")
+        client.loop_start()  # 后台线程处理接收
+        print(f"📡 [MQTT] 机器人调度系统上线！")
     except Exception as e:
         print(f"⚠️ [MQTT] 连接失败，请检查网络: {e}")
         return
 
     while True:
         time.sleep(SILENCE_TIMEOUT)
-        # 算一下谁说得最少
-        if sum(speaking_times.values()) > 5: # 会议总时长大于5秒才开始评判
-            most_silent_node = min(speaking_times, key=speaking_times.get)
-            avg_time = sum(speaking_times.values()) / 4.0
-            
-            # 如果最沉默的人时长远低于平均值，触发小车！
-            if speaking_times[most_silent_node] < (avg_time * 0.5):
-                payload = json.dumps({
-                    "action": "move",
-                    "target": most_silent_node,
-                    "reason": "silence_timeout"
-                })
-                client.publish(MQTT_TOPIC, payload)
-                print(f"🚗 [调度警报] {most_silent_node} 发言太少，已派遣小车前往破冰！")
+        with _cycle_lock:
+            if _robot_busy:
+                print("[调度] 机器人忙碌中，跳过本次检查，排队等待...")
+                continue
+            # 检查是否需要干预（发言时长失衡）
+            total = sum(speaking_times.values())
+            if total > 5:   # 会议总时长 > 5 秒才评判
+                avg_time = total / 4.0
+                most_silent = min(speaking_times, key=speaking_times.get)
+                if speaking_times[most_silent] < (avg_time * 0.5):
+                    # 触发！从第 0 个人开始顺序干预
+                    _cycle_index = 0
+                    _robot_busy = True
+                    print(f"⚠️ [触发干预] {most_silent} 发言严重偏少，开始新一轮顺序干预...")
+                    _send_next_intervention(client)
 
 def brain_worker():
     """实时监听、断句、算分贝的主大脑"""

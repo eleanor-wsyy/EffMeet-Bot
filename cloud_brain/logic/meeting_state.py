@@ -46,8 +46,8 @@ class MeetingState:
         silent_index = np.argmin(times)
         silent_user = list(self.users.keys())[silent_index]
         
-        print(f"\n⚠️ [触发干预] 话语权严重失衡！准备引导小车走向: {silent_user}")
+        print(f"\n⚠️ [触发干预] 话语权严重失衡！启动顺序干预，走向: {silent_user}")
         
-        # [核心优化]：直接下发节点 ID，让小车通过 NFC 标签识别目标
+        # 发送目标编号给机器人（纯数字，顺序由上层 INTERVENTION_ORDER 控制）
         if self.network:
             self.network.send_command(action="move", target_node=silent_user)

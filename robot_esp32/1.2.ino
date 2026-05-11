@@ -1,6 +1,8 @@
 // ============================================================
-// 会议干预机器人 v1.2
-// v1.1 基础 + 缓慢舵机摆动 + 回起点后 MQTT 回复
+// 会议干预机器人 v1.3
+// 4人逆时针排列：1(上) → 2(左) → 3(下) → 4(右)
+// 旋转方向：逆时针（左轮前进 + 右轮后退）
+// 回起点后通过 MQTT 发送 done|dir=X
 // ============================================================
 
 #include <WiFi.h>
@@ -97,7 +99,9 @@ void leftStop() {
 void motorsStop() { leftStop(); rightStop(); }
 
 // ============================================================
-// 原地差速顺时针旋转 steps × 90°
+// 原地差速逆时针旋转 steps × 90°
+// 逆时针：左轮前进 + 右轮后退
+// 方向对应：1(上/0°) → 2(左/90°CCW) → 3(下/180°) → 4(右/270°CCW)
 // ============================================================
 void rotateSteps(int steps) {
   if (steps == 0) return;
@@ -105,8 +109,8 @@ void rotateSteps(int steps) {
   int count = 0;
   bool prev = digitalRead(PIN_COUNT);
 
-  rightForward(ROTATE_SPEED);
-  leftBackward(ROTATE_SPEED);
+  leftForward(ROTATE_SPEED);   // 逆时针：左轮向前
+  rightBackward(ROTATE_SPEED); // 逆时针：右轮向后
 
   while (count < steps) {
     bool now = digitalRead(PIN_COUNT);
@@ -374,7 +378,7 @@ void mqttConnect() {
 void setup() {
   Serial.begin(115200);
   delay(800);
-  Serial.println("\n===== v1.2 缓慢舵机 + MQTT 回复 =====");
+  Serial.println("\n===== v1.3 逆时针4人干预 + MQTT 回复 =====");
 
   pinMode(PIN_FL,    INPUT);
   pinMode(PIN_ML,    INPUT);
