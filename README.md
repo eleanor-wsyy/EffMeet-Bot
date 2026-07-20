@@ -100,6 +100,15 @@ EffMeet-Bot-main/
 - 1 路红外计数传感器
 - 3.5 英寸 TFT LCD，当前固件使用 ILI9488
 
+已验证可编译的 Arduino 依赖版本：
+
+- 开发板核心：`esp32:esp32 3.0.7`
+- `PubSubClient 2.8.0`
+- `GFX Library for Arduino 1.5.0`
+
+`GFX Library for Arduino 1.6.7` 使用了更新的 ESP LCD API，不能与
+`esp32:esp32 3.0.7` 组合编译；升级 GFX 时需要同时升级 ESP32 核心。
+
 ## Python 依赖
 
 `cloud_brain/requirements.txt` 中包含的主要依赖：
