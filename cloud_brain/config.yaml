@@ -1,0 +1,33 @@
+# 网络通信配置
+mqtt:
+  broker: "broker.emqx.io"    # EMQX 免费公共测试服务器
+  port: 1883                   # 默认 TCP 端口
+  client_id: "EffMeet_Cloud_Core"
+
+  # 发布主题：发给机器人的控制指令（纯数字 "1"/"2"/"3"/"4"）
+  topic_control: "esp32s3/control"
+
+  # 订阅主题：接收机器人完成回复（done|dir=X）
+  topic_status: "esp32s3/status"
+
+  # 发布主题：一整圈干预结束后通知上层系统
+  topic_cycle_done: "effmeet/cycle/done"
+
+
+# 干预逻辑参数
+logic:
+  # 4人逆时针排列顺序（可改数字，但必须保持逆时针）：
+  # 1=上, 2=左, 3=下, 4=右
+  intervention_order: [1, 2, 3, 4]
+
+  # 检测到失衡后触发干预的方差阈值
+  variance_threshold: 15.0
+
+  # 两轮干预之间的最小等待时间（秒）
+  cooldown_seconds: 120
+
+  # 定时干预结算周期（秒）
+  intervention_interval: 120
+
+  # 判定发言失衡比例阈值（发言量少于平均发言量 * 比例阈值时触发干预）
+  imbalance_ratio_threshold: 0.5

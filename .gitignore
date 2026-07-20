@@ -1,0 +1,33 @@
+# Python 编译缓存
+__pycache__/
+*.py[cod]
+
+# 虚拟环境
+venv/
+env/
+.env
+cloud_brain/.venv/
+.venv/
+
+# 测试数据和日志 (保护测试者的声音隐私)
+temp_audio/
+cloud_brain/temp_audio/
+data/profiles/*
+data/logs/*
+*.wav
+*.pcm
+*.mp3
+*.xlsx
+
+# 配置文件 (防止泄露 MQTT 密码和服务器 IP)
+config_secret.yaml
+secrets.h
+robot_esp32/**/secrets.h
+
+# VSCode 配置文件
+.vscode/
+
+# 本地助手/工具配置
+.claude/
+.agents/
+.codex/
