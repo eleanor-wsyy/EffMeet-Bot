@@ -15,6 +15,7 @@
 #define ROTATE_SPEED    150
 #define TURN180_TIME    1100
 #define CROSS_PASS_MS   150     // 过十字后继续前进时长（毫秒）
+#define EXPRESSION_FEEDBACK_MS 4000
 
 // ============================================================
 // WiFi
@@ -61,7 +62,10 @@
 // ============================================================
 // 图片数组
 // ============================================================
-#include "image_array.h"     // 你的 480x320 1-bit 位图
+#include "image_array.h"     // 专注表情，480x320 1-bit 位图
+#include "reminder_image.h"  // 提醒表情，480x320 1-bit 位图
+#include "curious_image.h"   // 好奇表情，480x320 1-bit 位图
+#include "stable_image.h"    // 稳定表情，480x320 1-bit 位图
 
 // ============================================================
 // TFT 初始化（软件8位并口，引脚与传感器不冲突）
@@ -80,9 +84,75 @@ Arduino_ILI9488 gfx(&tftBus, 42, 1, false);   // RST=42, rotation=1(横屏)
 WiFiClient   espClient;
 PubSubClient mqtt(espClient);
 
-int  currentDir = 1;
-bool busy       = false;
-int  pendingCmd = -1;
+enum ExpressionId : int8_t {
+  EXPRESSION_NONE = -1,
+  EXPRESSION_FOCUS,
+  EXPRESSION_REMINDER,
+  EXPRESSION_CURIOUS,
+  EXPRESSION_STABLE
+};
+
+int          currentDir               = 1;
+bool         busy                     = false;
+int          pendingTarget            = -1;
+ExpressionId pendingArrivalExpression = EXPRESSION_REMINDER;
+ExpressionId pendingExpression        = EXPRESSION_NONE;
+unsigned long expressionRestoreAt     = 0;
+
+// 所有表情共用同一套尺寸、逐行绘制和屏幕校色逻辑。
+void drawExpression(const uint8_t* image) {
+  static uint16_t lineBuf[IMG_W];
+  for (int y = 0; y < IMG_H; y++) {
+    for (int x = 0; x < IMG_W; x++) {
+      int byteIdx = y * (IMG_W / 8) + (x / 8);
+      int bitIdx  = 7 - (x % 8);
+      uint8_t byteVal = pgm_read_byte(image + byteIdx);
+      lineBuf[x] = (byteVal & (1 << bitIdx)) ? TFT_WHITE : 0x0000;
+    }
+    gfx.draw16bitRGBBitmap(0, y, lineBuf, IMG_W, 1);
+  }
+}
+
+const uint8_t* expressionImage(ExpressionId expression) {
+  switch (expression) {
+    case EXPRESSION_REMINDER: return reminderImage;
+    case EXPRESSION_CURIOUS:  return curiousImage;
+    case EXPRESSION_STABLE:   return stableImage;
+    case EXPRESSION_FOCUS:
+    default:                  return focusImage;
+  }
+}
+
+const char* expressionName(ExpressionId expression) {
+  switch (expression) {
+    case EXPRESSION_REMINDER: return "reminder";
+    case EXPRESSION_CURIOUS:  return "curious";
+    case EXPRESSION_STABLE:   return "stable";
+    case EXPRESSION_FOCUS:    return "focus";
+    default:                  return "unknown";
+  }
+}
+
+ExpressionId parseExpressionName(const char* name) {
+  if (strcmp(name, "focus") == 0) return EXPRESSION_FOCUS;
+  if (strcmp(name, "reminder") == 0) return EXPRESSION_REMINDER;
+  if (strcmp(name, "curious") == 0) return EXPRESSION_CURIOUS;
+  if (strcmp(name, "stable") == 0) return EXPRESSION_STABLE;
+  return EXPRESSION_NONE;
+}
+
+void showExpression(ExpressionId expression, unsigned long durationMs = 0) {
+  drawExpression(expressionImage(expression));
+  expressionRestoreAt = durationMs > 0 ? millis() + durationMs : 0;
+  Serial.printf("[表情] %s\n", expressionName(expression));
+}
+
+void updateExpressionTimeout() {
+  if (expressionRestoreAt == 0) return;
+  if ((long)(millis() - expressionRestoreAt) >= 0) {
+    showExpression(EXPRESSION_FOCUS);
+  }
+}
 
 // ============================================================
 // 电机驱动
@@ -324,8 +394,9 @@ void trackBackToStart() {
 // ============================================================
 // 执行完整任务
 // ============================================================
-void doTask(int target) {
+void doTask(int target, ExpressionId arrivalExpression) {
   busy = true;
+  showExpression(EXPRESSION_FOCUS);
 
   int steps = (target - currentDir + 4) % 4;
   Serial.printf("方向 %d→%d，转%d步\n", currentDir, target, steps);
@@ -335,8 +406,10 @@ void doTask(int target) {
   Serial.println("循迹前进...");
   trackToEnd();
 
+  showExpression(arrivalExpression);
   Serial.println("原地停留 4 秒...");
-  delay(4000);
+  delay(EXPRESSION_FEEDBACK_MS);
+  showExpression(EXPRESSION_FOCUS);
 
   Serial.println("掉头...");
   turn180();
@@ -353,8 +426,16 @@ void doTask(int target) {
     mqttConnect();
   }
 
-  char msg[32];
-  snprintf(msg, sizeof(msg), "%s|dir=%d", MQTT_MSG_DONE, currentDir);
+  char msg[96];
+  snprintf(
+    msg,
+    sizeof(msg),
+    "%s|dir=%d|target=%d|expression=%s",
+    MQTT_MSG_DONE,
+    currentDir,
+    target,
+    expressionName(arrivalExpression)
+  );
   if (mqtt.publish(MQTT_TOPIC_PUB, msg)) {
     Serial.printf("已发送：%s → %s\n", MQTT_TOPIC_PUB, msg);
   } else {
@@ -370,18 +451,67 @@ void doTask(int target) {
 // ============================================================
 void mqttCallback(char* topic, byte* payload, unsigned int len) {
   if (len == 0) return;
-  char buf[4] = {0};
-  memcpy(buf, payload, len < 3 ? len : 3);
-  int cmd = atoi(buf);
 
-  if (cmd < 1 || cmd > 4) return;
-  if (busy) {
-    Serial.printf("[MQTT] 忙，忽略：%d\n", cmd);
+  char buf[48] = {0};
+  unsigned int copyLen = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
+  memcpy(buf, payload, copyLen);
+  buf[copyLen] = '\0';
+
+  if (strncmp(buf, "expr:", 5) == 0) {
+    ExpressionId expression = parseExpressionName(buf + 5);
+    if (expression == EXPRESSION_NONE) {
+      Serial.printf("[MQTT] 未知表情指令：%s\n", buf);
+      return;
+    }
+    if (busy) {
+      Serial.printf("[MQTT] 任务执行中，忽略表情指令：%s\n", buf);
+      return;
+    }
+    pendingExpression = expression;
+    Serial.printf("[MQTT] 收到表情：%s\n", expressionName(expression));
     return;
   }
 
-  Serial.printf("[MQTT] 收到：%d\n", cmd);
-  pendingCmd = cmd;
+  int target = -1;
+  ExpressionId arrivalExpression = EXPRESSION_REMINDER;
+
+  if (strlen(buf) == 1 && buf[0] >= '1' && buf[0] <= '4') {
+    target = buf[0] - '0';
+  } else if (strncmp(buf, "move:", 5) == 0) {
+    char* targetText = buf + 5;
+    char* expressionText = strchr(targetText, ':');
+    if (expressionText != nullptr) {
+      *expressionText = '\0';
+      expressionText++;
+      arrivalExpression = parseExpressionName(expressionText);
+      if (
+        arrivalExpression != EXPRESSION_REMINDER
+        && arrivalExpression != EXPRESSION_CURIOUS
+      ) {
+        Serial.printf("[MQTT] 移动指令表情无效：%s\n", expressionText);
+        return;
+      }
+    }
+    target = atoi(targetText);
+  }
+
+  if (target < 1 || target > 4) {
+    Serial.printf("[MQTT] 未知控制指令：%s\n", buf);
+    return;
+  }
+
+  if (busy) {
+    Serial.printf("[MQTT] 忙，忽略目标：%d\n", target);
+    return;
+  }
+
+  Serial.printf(
+    "[MQTT] 收到移动：目标=%d，到达表情=%s\n",
+    target,
+    expressionName(arrivalExpression)
+  );
+  pendingTarget = target;
+  pendingArrivalExpression = arrivalExpression;
 }
 
 // ============================================================
@@ -430,16 +560,7 @@ void setup() {
   gfx.begin();
   gfx.fillScreen(0x0000);
 
-  static uint16_t lineBuf[IMG_W];
-  for (int y = 0; y < IMG_H; y++) {
-    for (int x = 0; x < IMG_W; x++) {
-      int byteIdx = y * (IMG_W / 8) + (x / 8);
-      int bitIdx  = 7 - (x % 8);
-      uint8_t byteVal = pgm_read_byte(&logo[byteIdx]);
-      lineBuf[x] = (byteVal & (1 << bitIdx)) ? TFT_WHITE : 0x0000;
-    }
-    gfx.draw16bitRGBBitmap(0, y, lineBuf, IMG_W, 1);
-  }
+  showExpression(EXPRESSION_FOCUS);
   Serial.println("TFT 初始化完成，图片已显示");
 
   // WiFi
@@ -473,11 +594,23 @@ void setup() {
 void loop() {
   if (!mqtt.connected()) { mqttConnect(); }
   mqtt.loop();
+  updateExpressionTimeout();
 
-  if (pendingCmd != -1) {
-    int cmd = pendingCmd;
-    pendingCmd = -1;
-    doTask(cmd);
+  if (pendingExpression != EXPRESSION_NONE) {
+    ExpressionId expression = pendingExpression;
+    pendingExpression = EXPRESSION_NONE;
+    unsigned long duration = expression == EXPRESSION_STABLE
+      ? EXPRESSION_FEEDBACK_MS
+      : 0;
+    showExpression(expression, duration);
+  }
+
+  if (pendingTarget != -1) {
+    int target = pendingTarget;
+    ExpressionId arrivalExpression = pendingArrivalExpression;
+    pendingTarget = -1;
+    pendingArrivalExpression = EXPRESSION_REMINDER;
+    doTask(target, arrivalExpression);
   }
 
   delay(10);

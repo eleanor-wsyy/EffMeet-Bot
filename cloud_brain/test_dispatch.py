@@ -15,9 +15,9 @@
   python test_dispatch.py 3 1      # 3号和1号发言不足 → 提醒 3->1
 
 在 MQTTX 里：
-  订阅 esp32s3/control    <- 看云端发出的数字指令
+  订阅 esp32s3/control    <- 看云端发出的 move:<座位>:<表情> 指令
   订阅 effmeet/cycle/done <- 看本轮完成通知
-  向 esp32s3/status 发 "done|dir=X" <- 模拟机器人完成回复
+  向 esp32s3/status 发 "done|dir=2|target=3|expression=reminder" <- 模拟完成回复
 """
 
 import sys
@@ -53,8 +53,14 @@ _lock = threading.Lock()
 
 def send_next(client):
     target = ACTIVE_TARGETS[_cycle_index]
-    client.publish(MQTT_TOPIC_CONTROL, str(target))
-    print(f"[SEND] -> esp32s3/control : '{target}'  ({_cycle_index+1}/{len(ACTIVE_TARGETS)})")
+    occurrence = ACTIVE_TARGETS[:_cycle_index + 1].count(target)
+    expression = "reminder" if occurrence == 1 else "curious"
+    payload = f"move:{target}:{expression}"
+    client.publish(MQTT_TOPIC_CONTROL, payload)
+    print(
+        f"[SEND] -> esp32s3/control : '{payload}'  "
+        f"({_cycle_index+1}/{len(ACTIVE_TARGETS)})"
+    )
     sys.stdout.flush()
 
 

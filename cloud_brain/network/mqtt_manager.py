@@ -1,5 +1,4 @@
 import paho.mqtt.client as mqtt
-import json
 import random
 
 class MQTTManager:
@@ -32,12 +31,13 @@ class MQTTManager:
             print(f"✅ [MQTT] 成功连接服务器: {self.config['mqtt']['broker']}")
             # 订阅音频流和机器人状态
             client.subscribe(self.topic_status)
+            self.send_expression("focus")
             print(f"[MQTT] 已订阅机器人状态主题: {self.topic_status}")
         else:
             print(f"❌ [MQTT] 连接异常，错误码: {rc}")
 
     def _on_message(self, client, userdata, msg):
-        """处理来自端侧的消息（机器人完成回复 done|dir=X）"""
+        """处理来自端侧的消息（机器人完成回复包含方向、目标和表情）。"""
         payload = msg.payload.decode('utf-8', errors='ignore').strip()
         print(f"[MQTT] 收到消息 [{msg.topic}]: {payload}")
         
@@ -46,17 +46,30 @@ class MQTTManager:
             # 不同模块可根据需要进一步处理
             pass
 
-    def send_command(self, action, target_node):
+    def send_command(self, action, target_node, expression="reminder"):
         """
         下发控制指令给小车
         target_node: 目标节点编号，如 1 / 2 / 3 / 4
-        直接发纯数字字符串，ESP32 mqttCallback 只认这个格式
+        expression: 到达目标后显示 reminder 或 curious
         """
         # 从 node_key 提取编号，如 "node1" → "1"
         if isinstance(target_node, str) and target_node.startswith('node'):
             num = target_node.replace('node', '')
         else:
             num = str(target_node)
-        
-        self.client.publish(self.topic_control, num)
-        print(f"🚗 [MQTT指令下发] {num} → {self.topic_control}")
+
+        if expression not in {"reminder", "curious"}:
+            raise ValueError(f"Unsupported arrival expression: {expression}")
+
+        payload = f"move:{num}:{expression}"
+        self.client.publish(self.topic_control, payload)
+        print(f"🚗 [MQTT指令下发] {payload} → {self.topic_control}")
+
+    def send_expression(self, expression):
+        """Display an idle expression without moving the robot."""
+        if expression not in {"focus", "reminder", "curious", "stable"}:
+            raise ValueError(f"Unsupported expression: {expression}")
+
+        payload = f"expr:{expression}"
+        self.client.publish(self.topic_control, payload)
+        print(f"[MQTT表情下发] {payload} → {self.topic_control}")

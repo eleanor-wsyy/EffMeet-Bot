@@ -87,9 +87,8 @@ state_lock = threading.Lock()
 # 机器人调度状态。
 _robot_busy = False
 _cycle_index = 0
-_active_targets = []
-_last_intervention_target = None
-_recent_intervention_targets = deque(maxlen=1)
+_active_interventions = []
+_intervention_counts = {f"node{i}": 0 for i in range(1, 5)}
 _cycle_lock = threading.Lock()
 _mqtt_client_ref = None
 _whisper_model = None
@@ -149,7 +148,7 @@ def apply_demo_state(spec):
 
 def reset_runtime_state():
     """Clear all in-memory session state before a fresh run."""
-    global _robot_busy, _cycle_index, _active_targets, _last_intervention_target
+    global _robot_busy, _cycle_index, _active_interventions
 
     with state_lock:
         meeting_records.clear()
@@ -161,9 +160,9 @@ def reset_runtime_state():
     with _cycle_lock:
         _robot_busy = False
         _cycle_index = 0
-        _active_targets = []
-        _last_intervention_target = None
-        _recent_intervention_targets.clear()
+        _active_interventions = []
+        for key in _intervention_counts:
+            _intervention_counts[key] = 0
 
     print("[RESET] 会话状态已清空，准备开始新实验。")
 
@@ -277,12 +276,13 @@ def whisper_worker():
 
 
 def _send_next_intervention(client):
-    # 向机器人发布当前这一轮需要干预的目标座位编号。
-    target = _active_targets[_cycle_index]
-    client.publish(MQTT_TOPIC_CONTROL, str(target))
+    # 同时下发目标座位与本次到达后需要展示的表情。
+    target, expression = _active_interventions[_cycle_index]
+    payload = f"move:{target}:{expression}"
+    client.publish(MQTT_TOPIC_CONTROL, payload)
     print(
-        f"[发送] -> {MQTT_TOPIC_CONTROL}: '{target}' "
-        f"（{_cycle_index + 1}/{len(_active_targets)}）"
+        f"[发送] -> {MQTT_TOPIC_CONTROL}: '{payload}' "
+        f"（{_cycle_index + 1}/{len(_active_interventions)}）"
     )
     sys.stdout.flush()
 
@@ -294,7 +294,7 @@ def _on_robot_done(client, msg_payload):
 
     with _cycle_lock:
         _cycle_index += 1
-        if _cycle_index >= len(_active_targets):
+        if _cycle_index >= len(_active_interventions):
             _cycle_index = 0
             _robot_busy = False
             client.publish(MQTT_TOPIC_CYCLE_DONE, "cycle_done")
@@ -307,7 +307,7 @@ def _on_robot_done(client, msg_payload):
 
 
 def mqtt_monitor_worker(schedule_interval):
-    global _robot_busy, _cycle_index, _mqtt_client_ref, _last_intervention_target
+    global _robot_busy, _cycle_index, _mqtt_client_ref
 
     client_id = "EffMeet_Brain_" + str(random.randint(10000, 99999))
     client = mqtt.Client(client_id=client_id)
@@ -317,7 +317,9 @@ def mqtt_monitor_worker(schedule_interval):
     def on_connect(c, userdata, flags, rc):
         if rc == 0:
             c.subscribe(MQTT_TOPIC_STATUS)
+            c.publish(MQTT_TOPIC_CONTROL, "expr:focus")
             print(f"[MQTT] 已连接 Broker，并订阅机器人状态主题：{MQTT_TOPIC_STATUS}")
+            print("[MQTT] 已下发等待表情：expr:focus")
         else:
             print(f"[MQTT] 连接异常，返回码：{rc}")
         sys.stdout.flush()
@@ -350,40 +352,39 @@ def mqtt_monitor_worker(schedule_interval):
                 sorted_nodes = sorted(speaking_times.items(), key=lambda x: x[1])
 
             if total <= 5:
+                client.publish(MQTT_TOPIC_CONTROL, "expr:stable")
+                print(
+                    f"[调度] 总发言时长 {total:.1f}s，不触发干预；"
+                    "已发送稳定表情，4 秒后机器人自动恢复专注。"
+                )
                 continue
 
             avg_time = total / 4.0
             threshold = avg_time * IMBALANCE_RATIO_THRESHOLD
 
             candidate_node, candidate_time = sorted_nodes[0]
-            is_avoided = False
-            last_target = _recent_intervention_targets[-1] if _recent_intervention_targets else None
-            if candidate_node == last_target and len(sorted_nodes) > 1:
-                candidate_node, candidate_time = sorted_nodes[1]
-                is_avoided = True
 
             if candidate_time < threshold:
                 target_num = int(candidate_node.replace("node", ""))
-                _active_targets[:] = [target_num]
+                _intervention_counts[candidate_node] += 1
+                intervention_count = _intervention_counts[candidate_node]
+                expression = "reminder" if intervention_count == 1 else "curious"
+                _active_interventions[:] = [(target_num, expression)]
                 _cycle_index = 0
                 _robot_busy = True
-                avoid_msg = (
-                    f" 已跳过上一轮刚干预过的 {_last_intervention_target}；"
-                    if is_avoided
-                    else ""
-                )
-                _last_intervention_target = candidate_node
-                _recent_intervention_targets.append(candidate_node)
                 print(
-                    f"[触发]{avoid_msg}{candidate_node} 发言 "
-                    f"{candidate_time:.1f}s，低于阈值 {threshold:.1f}s"
+                    f"[触发] {candidate_node} 发言 {candidate_time:.1f}s，"
+                    f"低于阈值 {threshold:.1f}s；第 {intervention_count} 次干预，"
+                    f"表情={expression}"
                 )
-                print(f"[触发] 本轮干预目标：{_active_targets}")
+                print(f"[触发] 本轮干预：{_active_interventions}")
                 _send_next_intervention(client)
             else:
+                client.publish(MQTT_TOPIC_CONTROL, "expr:stable")
                 print(
                     f"[调度] 发言分布暂时均衡。候选节点 {candidate_node}: "
-                    f"{candidate_time:.1f}s >= {threshold:.1f}s"
+                    f"{candidate_time:.1f}s >= {threshold:.1f}s；"
+                    "已发送稳定表情，4 秒后机器人自动恢复专注。"
                 )
 
         sys.stdout.flush()

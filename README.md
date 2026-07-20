@@ -67,18 +67,20 @@ EffMeet-Bot-main/
 - 总发言时长小于等于 5 秒时不触发干预。
 - 以 4 人平均发言时长为基准。
 - 若最低发言者低于 `平均值 * 0.5`，则触发一次干预。
-- 如果上一轮刚干预过同一个节点，会优先跳过它，改看第二低的节点。
+- 每位参会者独立累计干预次数：第 1 次显示提醒表情，第 2 次及以后显示好奇表情。
+- 未触发干预时显示稳定表情 4 秒，随后自动恢复专注表情。
+- 干预次数按当前程序会话累计，重新启动或重置会话后归零。
 
 ## 机器人端功能
 
 `robot_esp32/1.3/1.3.ino` 负责：
 
 - 连接 Wi-Fi 和 MQTT Broker。
-- 订阅 `esp32s3/control`，接收 `1` 到 `4` 的目标方向。
+- 订阅 `esp32s3/control`，接收移动与表情指令。
 - 控制 L298N 电机驱动，按目标方向巡线前进。
 - 利用 5 路循迹传感器和 1 路计数传感器完成转向、到点、回程。
-- 到达目标后在 TFT 上显示图片。
-- 执行完毕后向 `esp32s3/status` 发布 `done|dir=X`。
+- 等待和移动期间显示专注表情，到达目标后按干预次数显示提醒或好奇表情。
+- 执行完毕后向 `esp32s3/status` 发布包含方向、目标和表情的 `done` 回包。
 
 ## 运行环境
 
@@ -216,9 +218,28 @@ broker.emqx.io:1883
 
 | 方向 | 主题 | 说明 |
 | --- | --- | --- |
-| 云端 -> 机器人 | `esp32s3/control` | 下发目标方向，payload 为 `1` / `2` / `3` / `4` |
-| 机器人 -> 云端 | `esp32s3/status` | 机器人完成后回传，payload 形如 `done|dir=X` |
+| 云端 -> 机器人 | `esp32s3/control` | 下发移动或表情指令 |
+| 机器人 -> 云端 | `esp32s3/status` | 机器人完成后回传任务状态 |
 | 云端 -> 上层系统 | `effmeet/cycle/done` | 一轮干预结束后发布 `cycle_done` |
+
+控制 payload：
+
+| 时机 | payload | 机器人行为 |
+| --- | --- | --- |
+| 等待下一轮检查 | `expr:focus` | 持续显示专注 |
+| 同一人第 1 次干预 | `move:N:reminder` | 专注状态移动，到达后显示提醒 4 秒，再恢复专注并返程 |
+| 同一人第 2 次及以后干预 | `move:N:curious` | 专注状态移动，到达后显示好奇 4 秒，再恢复专注并返程 |
+| 本轮没有触发干预 | `expr:stable` | 显示稳定 4 秒，然后自动恢复专注 |
+| 单独测试表情 | `expr:reminder` / `expr:curious` | 直接切换到指定表情，直到收到下一条表情或移动指令 |
+
+`N` 为 `1` 到 `4` 的座位方向。旧版纯数字 payload `1` / `2` / `3` / `4`
+仍兼容，并按 `move:N:reminder` 处理。
+
+任务完成回包示例：
+
+```text
+done|dir=3|target=1|expression=curious
+```
 
 方向编号约定：
 
@@ -252,7 +273,7 @@ GET http://127.0.0.1:5000/api/get_meeting_data
 - `test_local_mic.py`：测试本地麦克风和 VAD。
 - `test_multi_mic.py`：测试 4 路麦克风输入与统计。
 - `test_dispatch.py`：模拟机器人回包，验证 MQTT 干预链路。
-- `test_antirepeat.py`：验证防重复干预逻辑。
+- `test_intervention_expressions.py`：验证同一参会者的提醒/好奇分级干预与稳定表情逻辑。
 - `test_meeting_logic.py`：验证会议状态和调度逻辑。
 
 示例：
@@ -260,7 +281,7 @@ GET http://127.0.0.1:5000/api/get_meeting_data
 ```powershell
 cd cloud_brain
 python test_dispatch.py
-python test_antirepeat.py
+python test_intervention_expressions.py
 ```
 
 ## 代码说明

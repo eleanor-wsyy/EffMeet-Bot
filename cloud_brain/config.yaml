@@ -4,10 +4,10 @@ mqtt:
   port: 1883                   # 默认 TCP 端口
   client_id: "EffMeet_Cloud_Core"
 
-  # 发布主题：发给机器人的控制指令（纯数字 "1"/"2"/"3"/"4"）
+  # 发布主题：移动用 move:<座位>:<表情>，单独切换表情用 expr:<表情>
   topic_control: "esp32s3/control"
 
-  # 订阅主题：接收机器人完成回复（done|dir=X）
+  # 订阅主题：接收机器人完成回复（done|dir=X|target=N|expression=NAME）
   topic_status: "esp32s3/status"
 
   # 发布主题：一整圈干预结束后通知上层系统
