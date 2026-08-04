@@ -19,7 +19,6 @@ import numpy as np
 import paho.mqtt.client as mqtt
 import sounddevice as sd
 from flask import Flask, jsonify, render_template, request
-from faster_whisper import WhisperModel
 
 from core.activity_engine import ActivityEngine
 from core.vad_engine import VADEngine
@@ -60,6 +59,7 @@ ABSOLUTE_DB_FLOOR = 45.0
 SPEECH_ABOVE_NOISE_DB = 10.0
 WINNER_MARGIN_DB = 4.0
 USE_VAD = True
+USE_WHISPER = True
 
 # robust 模式下的判定参数（见 判定改进设计.md）。
 SPEECH_HI_DB = 10.0          # 双门限开口高门限（相对底噪）
@@ -180,6 +180,16 @@ def parse_args(argv):
         choices=["robust", "legacy"],
         default=DETECT_MODE,
         help="说话人判定模式：robust 使用自适应底噪+主导说话人+静音容忍；legacy 保留旧瞬时判定。",
+    )
+    parser.add_argument(
+        "--no-whisper",
+        action="store_true",
+        help="不启动语音转写线程（不加载 faster-whisper / torch），仅录音+人声判定+干预。",
+    )
+    parser.add_argument(
+        "--no-vad",
+        action="store_true",
+        help="不初始化 Silero VAD（不加载 torch）。robust 判定本身不依赖 VAD。",
     )
     return parser.parse_args(argv)
 
@@ -659,9 +669,12 @@ def get_meeting_data():
 
 def get_whisper_model():
     # 延迟加载 Whisper，避免导入模块时就下载/加载模型，方便排查启动问题。
+    # 注意：faster_whisper 依赖 torch，只在真正需要转写时才 import，被打包剥离。
     global _whisper_model
     if _whisper_model is None:
         print("[启动] 正在加载 Faster-Whisper tiny 模型，请稍等...")
+        from faster_whisper import WhisperModel
+
         _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
         print("[启动] Faster-Whisper 模型加载完成。")
     return _whisper_model
@@ -1422,10 +1435,22 @@ def brain_worker():
 def main():
     # 程序入口：后台只做就绪准备；明确点击“开始实验”后才打开麦克风录音。
     global _microphones, _no_mic_mode, DETECT_MODE, _activity_engine
+    global USE_WHISPER, USE_VAD
     args = parse_args(sys.argv[1:])
     if args.schedule_interval > 0:
         global SILENCE_TIMEOUT
         SILENCE_TIMEOUT = args.schedule_interval
+
+    # 默认开启转写与 VAD；打 exe 剥离 torch 时，用 --no-whisper / --no-vad 关闭。
+    # PyInstaller 打包（sys.frozen）默认关闭，保证 exe 双击即可运行、不依赖 torch。
+    USE_WHISPER = not getattr(sys, "frozen", False)
+    USE_VAD = not getattr(sys, "frozen", False)
+    if args.no_whisper:
+        USE_WHISPER = False
+        print("[启动] 已禁用语音转写（--no-whisper），仅录音+人声判定+干预。")
+    if args.no_vad:
+        USE_VAD = False
+        print("[启动] 已禁用 Silero VAD（--no-vad），robust 人声判定仍生效。")
 
     DETECT_MODE = args.detect_mode
     if DETECT_MODE == "robust":
@@ -1482,7 +1507,8 @@ def main():
         target=lambda: app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False),
         daemon=True,
     ).start()
-    threading.Thread(target=whisper_worker, daemon=True).start()
+    if USE_WHISPER:
+        threading.Thread(target=whisper_worker, daemon=True).start()
     threading.Thread(target=mqtt_monitor_worker, args=(SILENCE_TIMEOUT,), daemon=True).start()
     threading.Thread(target=robot_watchdog_worker, daemon=True).start()
 
