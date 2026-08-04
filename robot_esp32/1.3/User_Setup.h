@@ -1,38 +1,31 @@
 // ============================================================
-// TFT_eSPI User_Setup.h — 3.5" TFT Shield MCUFriend 并口
-// 适用于: ILI9341 / ILI9486 / ILI9488 等 8-bit 并口屏
-// 用法: 替换 Arduino/libraries/TFT_eSPI/User_Setup.h
+// 接线参考（当前固件不使用 TFT_eSPI）
 // ============================================================
+//
+// robot_esp32/1.3/1.3.ino 使用 Arduino_GFX_Library，并在 ino 文件中
+// 直接创建 Arduino_SWPAR8 和 Arduino_ILI9488。无需替换任何 Arduino
+// 库目录中的 User_Setup.h。
+//
+// 下面的定义只用于集中记录现场接线，必须与 1.3.ino 保持一致：
 
-// --- 驱动选择（依次只开一个，不行的换另一个）---
-#define ILI9488_DRIVER       // 先试这个，3.5"屏常见
-// #define ILI9486_DRIVER    // 如果不行换这个
-// #define ILI9341_DRIVER    // 或这个
+#define TFT_DC   36
+#define TFT_CS   35
+#define TFT_WR   37
+#define TFT_RD   38
+#define TFT_RST  42
 
-// --- ESP32-S3 引脚定义 ---
-#define TFT_CS   19          // A3 → IO19
-#define TFT_DC   2           // A2 → IO2
-#define TFT_RST  33          // A4 → IO33
-#define TFT_WR   3           // A1 → IO3
-// TFT_RD 接 3.3V，不配置
+#define TFT_D0    2
+#define TFT_D1    3
+#define TFT_D2    8
+#define TFT_D3    9
+#define TFT_D4   10
+#define TFT_D5   11
+#define TFT_D6   12
+#define TFT_D7   19
 
-// --- 8 位数据口 ---
-#define TFT_D0   8           // D8 孔
-#define TFT_D1   9           // D9 孔
-#define TFT_D2   10          // D2 孔
-#define TFT_D3   11          // D3 孔
-#define TFT_D4   12          // D4 孔
-#define TFT_D5   16          // D5 孔
-#define TFT_D6   17          // D6 孔
-#define TFT_D7   18          // D7 孔
-
-// --- 屏幕尺寸 ---
 #define TFT_WIDTH  480
 #define TFT_HEIGHT 320
 
-// --- 字体 ---
-#define SMOOTH_FONT
-
-// --- SPI 频率 ---
-#define SPI_FREQUENCY  40000000
-#define SPI_READ_FREQUENCY  20000000
+// 特别注意：旧说明曾把 RST 写成 IO33，与实际固件的 IO42 不一致。
+// 当前版本统一使用 IO42。若现场硬件仍接在 IO33，请先改线到 IO42，
+// 不要同时修改两份配置。

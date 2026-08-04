@@ -16,6 +16,11 @@
 #define TURN180_TIME    1100
 #define CROSS_PASS_MS   150     // 过十字后继续前进时长（毫秒）
 #define EXPRESSION_FEEDBACK_MS 4000
+#define ROTATE_TIMEOUT_MS       15000
+#define ALIGN_TIMEOUT_MS         5000
+#define TRACK_TIMEOUT_MS        60000
+#define MQTT_RECONNECT_MS        3000
+#define WIFI_RECONNECT_MS        5000
 
 // ============================================================
 // WiFi
@@ -71,9 +76,10 @@
 // TFT 初始化（软件8位并口，引脚与传感器不冲突）
 // ============================================================
 // D0-D7: IO2,3,8,9,10,11,12,19
-// DC:IO36  CS:IO35  WR:IO37  RD:IO38  RST:IO33
+// DC:IO36  CS:IO35  WR:IO37  RD:IO38  RST:IO42
+#define TFT_RST 42
 Arduino_SWPAR8  tftBus(36, 35, 37, 38, 2, 3, 8, 9, 10, 11, 12, 19);
-Arduino_ILI9488 gfx(&tftBus, 42, 1, false);   // RST=42, rotation=1(横屏)
+Arduino_ILI9488 gfx(&tftBus, TFT_RST, 1, false);   // rotation=1（横屏）
 
 // 校色白色 (标准 0xFFFF 偏绿)
 #define TFT_WHITE 0xFFBE
@@ -98,10 +104,32 @@ int          pendingTarget            = -1;
 ExpressionId pendingArrivalExpression = EXPRESSION_REMINDER;
 ExpressionId pendingExpression        = EXPRESSION_NONE;
 unsigned long expressionRestoreAt     = 0;
+unsigned long lastMqttReconnectAt     = 0;
+unsigned long lastWifiReconnectAt     = 0;
+uint32_t      renderedFrameCount      = 0;
+char          pendingStatus[128]       = {0};
+
+bool mqttConnect();
+void serviceNetwork();
+void publishStatus(const char* message);
+
+void cooperativeDelay(unsigned long durationMs) {
+  unsigned long startedAt = millis();
+  while (millis() - startedAt < durationMs) {
+    serviceNetwork();
+    delay(5);
+  }
+}
 
 // 所有表情共用同一套尺寸、逐行绘制和屏幕校色逻辑。
 void drawExpression(const uint8_t* image) {
   static uint16_t lineBuf[IMG_W];
+  unsigned long startedAt = millis();
+
+  // 一次设置整屏地址窗口，再按行连续写像素。旧实现逐像素重复发送
+  // CASET/PASET/RAMWR，既慢又容易在中途留下半屏；这里将命令量降到一帧一次。
+  gfx.startWrite();
+  gfx.writeAddrWindow(0, 0, IMG_W, IMG_H);
   for (int y = 0; y < IMG_H; y++) {
     for (int x = 0; x < IMG_W; x++) {
       int byteIdx = y * (IMG_W / 8) + (x / 8);
@@ -109,8 +137,16 @@ void drawExpression(const uint8_t* image) {
       uint8_t byteVal = pgm_read_byte(image + byteIdx);
       lineBuf[x] = (byteVal & (1 << bitIdx)) ? TFT_WHITE : 0x0000;
     }
-    gfx.draw16bitRGBBitmap(0, y, lineBuf, IMG_W, 1);
+    gfx.writePixels(lineBuf, IMG_W);
   }
+  gfx.endWrite();
+
+  renderedFrameCount++;
+  Serial.printf(
+    "[TFT] 完整帧 #%lu，耗时 %lums\n",
+    (unsigned long)renderedFrameCount,
+    millis() - startedAt
+  );
 }
 
 const uint8_t* expressionImage(ExpressionId expression) {
@@ -145,6 +181,15 @@ void showExpression(ExpressionId expression, unsigned long durationMs = 0) {
   drawExpression(expressionImage(expression));
   expressionRestoreAt = durationMs > 0 ? millis() + durationMs : 0;
   Serial.printf("[表情] %s\n", expressionName(expression));
+}
+
+void recoverDisplay(ExpressionId expression) {
+  // 电机启停产生的电源波动或干扰可能让 LCD 控制器状态异常。
+  // 在到达和返程结束、电机已经停止时重新硬复位并绘制完整帧。
+  gfx.begin();
+  gfx.fillScreen(0x0000);
+  showExpression(expression);
+  Serial.printf("[TFT] 已复位并恢复 %s 表情\n", expressionName(expression));
 }
 
 void updateExpressionTimeout() {
@@ -188,65 +233,90 @@ void motorsStop() { leftStop(); rightStop(); }
 // ============================================================
 // 原地差速顺时针旋转
 // ============================================================
-void rotateSteps(int steps) {
-  if (steps == 0) return;
+bool rotateSteps(int steps) {
+  if (steps == 0) return true;
 
   int count = 0;
   bool prev = digitalRead(PIN_COUNT);
+  unsigned long startedAt = millis();
 
   rightForward(ROTATE_SPEED);
   leftBackward(ROTATE_SPEED);
 
   while (count < steps) {
+    if (millis() - startedAt >= ROTATE_TIMEOUT_MS) {
+      motorsStop();
+      Serial.println("[故障] 旋转计数超时，已停止电机");
+      return false;
+    }
     bool now = digitalRead(PIN_COUNT);
     if (!prev && now) count++;
     prev = now;
-    delay(5);
+    cooperativeDelay(5);
   }
   // 多转一小段越过最后一条线，避免卡在分界线
-  delay(80);
+  cooperativeDelay(80);
   motorsStop();
-  delay(300);
+  cooperativeDelay(300);
+  return true;
 }
 
 // ============================================================
 // 旋转后对线校准
 // ============================================================
-void alignToLine() {
+bool alignToLine() {
   int mid = digitalRead(PIN_MID);
   int ml  = digitalRead(PIN_ML);
   int mr  = digitalRead(PIN_MR);
   int fl  = digitalRead(PIN_FL);
   int fr  = digitalRead(PIN_FR);
 
-  if (mid == HIGH) return;
+  if (mid == HIGH) return true;
+
+  unsigned long startedAt = millis();
 
   if (fl == HIGH || ml == HIGH) {
     while (digitalRead(PIN_MID) != HIGH) {
+      if (millis() - startedAt >= ALIGN_TIMEOUT_MS) {
+        motorsStop();
+        Serial.println("[故障] 左侧对线超时，已停止电机");
+        return false;
+      }
       rightForward(ROTATE_SPEED / 2);
       leftBackward(ROTATE_SPEED / 2);
-      delay(5);
+      cooperativeDelay(5);
     }
   } else if (fr == HIGH || mr == HIGH) {
     while (digitalRead(PIN_MID) != HIGH) {
+      if (millis() - startedAt >= ALIGN_TIMEOUT_MS) {
+        motorsStop();
+        Serial.println("[故障] 右侧对线超时，已停止电机");
+        return false;
+      }
       leftForward(ROTATE_SPEED / 2);
       rightBackward(ROTATE_SPEED / 2);
-      delay(5);
+      cooperativeDelay(5);
     }
   } else {
-    unsigned long start = millis();
     rightForward(ROTATE_SPEED / 2);
     leftBackward(ROTATE_SPEED / 2);
-    while (millis() - start < 2000) {
+    while (millis() - startedAt < ALIGN_TIMEOUT_MS) {
       if (digitalRead(PIN_MID) == HIGH ||
           digitalRead(PIN_ML) == HIGH ||
           digitalRead(PIN_MR) == HIGH) break;
-      delay(5);
+      cooperativeDelay(5);
     }
   }
 
   motorsStop();
-  delay(100);
+  cooperativeDelay(100);
+  bool foundLine = digitalRead(PIN_MID) == HIGH
+    || digitalRead(PIN_ML) == HIGH
+    || digitalRead(PIN_MR) == HIGH;
+  if (!foundLine) {
+    Serial.println("[故障] 对线未找到轨迹，已停止电机");
+  }
+  return foundLine;
 }
 
 // ============================================================
@@ -276,8 +346,14 @@ void trackRight2() {                    // 急右转：双轮反向原地急调
 // ============================================================
 // 循迹至终点（五路全黑）
 // ============================================================
-void trackToEnd() {
+bool trackToEnd() {
+  unsigned long startedAt = millis();
   while (true) {
+    if (millis() - startedAt >= TRACK_TIMEOUT_MS) {
+      motorsStop();
+      Serial.println("[故障] 前往终点超时，已停止电机");
+      return false;
+    }
     int fl  = digitalRead(PIN_FL);
     int ml  = digitalRead(PIN_ML);
     int mid = digitalRead(PIN_MID);
@@ -288,7 +364,7 @@ void trackToEnd() {
     if (blackCount >= 3) {
       motorsStop();
       Serial.println("到达终点");
-      return;
+      return true;
     }
 
     if (mid == HIGH) trackGo();
@@ -307,10 +383,10 @@ void trackToEnd() {
     if (blackCount >= 3) {
       motorsStop();
       Serial.println("到达终点");
-      return;
+      return true;
     }
 
-    delay(10);
+    cooperativeDelay(10);
   }
 }
 
@@ -320,21 +396,27 @@ void trackToEnd() {
 void turn180() {
   rightForward(ROTATE_SPEED);
   leftBackward(ROTATE_SPEED);
-  delay(TURN180_TIME);
+  cooperativeDelay(TURN180_TIME);
   motorsStop();
-  delay(200);
+  cooperativeDelay(200);
 }
 
 // ============================================================
 // 循迹返回起点
 // ============================================================
-void trackBackToStart() {
+bool trackBackToStart() {
+  unsigned long startedAt = millis();
   while (true) {
+    if (millis() - startedAt >= TRACK_TIMEOUT_MS) {
+      motorsStop();
+      Serial.println("[故障] 返回起点超时，已停止电机");
+      return false;
+    }
     if (ON_BLACK(PIN_COUNT)) {
       trackGo();
-      delay(CROSS_PASS_MS);
+      cooperativeDelay(CROSS_PASS_MS);
       motorsStop();
-      delay(100);
+      cooperativeDelay(100);
 
       // 确保 IO1 离开黑线，否则下次旋转无法计数
       if (ON_BLACK(PIN_COUNT)) {
@@ -342,15 +424,15 @@ void trackBackToStart() {
         while (ON_BLACK(PIN_COUNT) && creep < 50) {
           rightForward(ROTATE_SPEED / 3);
           leftBackward(ROTATE_SPEED / 3);
-          delay(10); creep++;
+          cooperativeDelay(10); creep++;
         }
         motorsStop();
         Serial.printf("顺时针微调 %dms 离开黑线\n", creep * 10);
       }
 
-      delay(200);
+      cooperativeDelay(200);
       Serial.println("回到起点");
-      return;
+      return true;
     }
 
     int fl  = digitalRead(PIN_FL);
@@ -368,63 +450,85 @@ void trackBackToStart() {
     // 转向过程中可能已到十字，二次检测 IO1
     if (ON_BLACK(PIN_COUNT)) {
       trackGo();
-      delay(CROSS_PASS_MS);
+      cooperativeDelay(CROSS_PASS_MS);
       motorsStop();
-      delay(100);
+      cooperativeDelay(100);
 
       if (ON_BLACK(PIN_COUNT)) {
         int creep = 0;
         while (ON_BLACK(PIN_COUNT) && creep < 50) {
           rightForward(ROTATE_SPEED / 3);
           leftBackward(ROTATE_SPEED / 3);
-          delay(10); creep++;
+          cooperativeDelay(10); creep++;
         }
         motorsStop();
       }
 
-      delay(200);
+      cooperativeDelay(200);
       Serial.println("回到起点");
-      return;
+      return true;
     }
 
-    delay(10);
+    cooperativeDelay(10);
   }
 }
 
 // ============================================================
 // 执行完整任务
 // ============================================================
+void abortTask(int target, const char* phase) {
+  motorsStop();
+  recoverDisplay(EXPRESSION_FOCUS);
+
+  char msg[96];
+  snprintf(msg, sizeof(msg), "error|target=%d|phase=%s", target, phase);
+  publishStatus(msg);
+
+  busy = false;
+  Serial.printf("[任务终止] 目标=%d，阶段=%s\n", target, phase);
+}
+
 void doTask(int target, ExpressionId arrivalExpression) {
   busy = true;
   showExpression(EXPRESSION_FOCUS);
 
   int steps = (target - currentDir + 4) % 4;
   Serial.printf("方向 %d→%d，转%d步\n", currentDir, target, steps);
-  rotateSteps(steps);
-  alignToLine();
+  if (!rotateSteps(steps)) {
+    abortTask(target, "rotate");
+    return;
+  }
+  if (!alignToLine()) {
+    abortTask(target, "align_outbound");
+    return;
+  }
 
   Serial.println("循迹前进...");
-  trackToEnd();
+  if (!trackToEnd()) {
+    abortTask(target, "outbound");
+    return;
+  }
 
-  showExpression(arrivalExpression);
+  recoverDisplay(arrivalExpression);
   Serial.println("原地停留 4 秒...");
-  delay(EXPRESSION_FEEDBACK_MS);
+  cooperativeDelay(EXPRESSION_FEEDBACK_MS);
   showExpression(EXPRESSION_FOCUS);
 
   Serial.println("掉头...");
   turn180();
-  alignToLine();
+  if (!alignToLine()) {
+    abortTask(target, "align_return");
+    return;
+  }
 
   Serial.println("返回起点...");
-  trackBackToStart();
+  if (!trackBackToStart()) {
+    abortTask(target, "return");
+    return;
+  }
 
   currentDir = ((target - 1 + 2) % 4) + 1;
-
-  // 确保 MQTT 连接活跃再发送
-  mqtt.loop();
-  if (!mqtt.connected()) {
-    mqttConnect();
-  }
+  recoverDisplay(EXPRESSION_FOCUS);
 
   char msg[96];
   snprintf(
@@ -436,11 +540,7 @@ void doTask(int target, ExpressionId arrivalExpression) {
     target,
     expressionName(arrivalExpression)
   );
-  if (mqtt.publish(MQTT_TOPIC_PUB, msg)) {
-    Serial.printf("已发送：%s → %s\n", MQTT_TOPIC_PUB, msg);
-  } else {
-    Serial.println("MQTT 发送失败");
-  }
+  publishStatus(msg);
 
   busy = false;
   Serial.printf("任务完成，当前方向：%d\n", currentDir);
@@ -517,17 +617,86 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
 // ============================================================
 // MQTT 连接
 // ============================================================
-void mqttConnect() {
-  while (!mqtt.connected()) {
-    Serial.print("连接 MQTT...");
-    String id = "ESP32_" + String(random(0xffff), HEX);
-    if (mqtt.connect(id.c_str())) {
-      Serial.println("成功");
-      mqtt.subscribe(MQTT_TOPIC_SUB);
-    } else {
-      Serial.printf("失败 rc=%d\n", mqtt.state());
-      delay(5000);
+void flushPendingStatus() {
+  if (pendingStatus[0] == '\0' || !mqtt.connected()) return;
+  if (mqtt.publish(MQTT_TOPIC_PUB, pendingStatus)) {
+    Serial.printf("[MQTT] 补发状态：%s\n", pendingStatus);
+    pendingStatus[0] = '\0';
+  }
+}
+
+void publishStatus(const char* message) {
+  if (mqtt.connected() && mqtt.publish(MQTT_TOPIC_PUB, message)) {
+    Serial.printf("[MQTT] 已发送：%s → %s\n", MQTT_TOPIC_PUB, message);
+    return;
+  }
+
+  strncpy(pendingStatus, message, sizeof(pendingStatus) - 1);
+  pendingStatus[sizeof(pendingStatus) - 1] = '\0';
+  Serial.printf("[MQTT] 暂存待补发状态：%s\n", pendingStatus);
+}
+
+void publishExpressionAck(ExpressionId expression) {
+  if (!mqtt.connected()) return;
+  char msg[80];
+  snprintf(
+    msg,
+    sizeof(msg),
+    "ack|type=expression|expression=%s|frame=%lu",
+    expressionName(expression),
+    (unsigned long)renderedFrameCount
+  );
+  mqtt.publish(MQTT_TOPIC_PUB, msg);
+}
+
+bool mqttConnect() {
+  if (mqtt.connected()) return true;
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  Serial.print("连接 MQTT...");
+  String id = "EffMeet_ESP32_" + String((uint32_t)ESP.getEfuseMac(), HEX);
+  bool connected = mqtt.connect(
+    id.c_str(),
+    MQTT_TOPIC_PUB,
+    0,
+    true,
+    "offline"
+  );
+  if (connected) {
+    Serial.println("成功");
+    mqtt.subscribe(MQTT_TOPIC_SUB);
+    mqtt.publish(MQTT_TOPIC_PUB, "online", true);
+    flushPendingStatus();
+    return true;
+  }
+
+  Serial.printf("失败 rc=%d\n", mqtt.state());
+  return false;
+}
+
+void serviceNetwork() {
+  unsigned long now = millis();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    // 行驶时不做可能阻塞的重连，保证电机控制循环不中断。
+    if (!busy && now - lastWifiReconnectAt >= WIFI_RECONNECT_MS) {
+      lastWifiReconnectAt = now;
+      Serial.println("[WiFi] 连接中断，正在重连...");
+      WiFi.reconnect();
     }
+    return;
+  }
+
+  if (mqtt.connected()) {
+    mqtt.loop();
+    flushPendingStatus();
+    return;
+  }
+
+  // 已断线时等任务结束再建立 TCP 连接；行驶期间只做实时电机控制。
+  if (!busy && now - lastMqttReconnectAt >= MQTT_RECONNECT_MS) {
+    lastMqttReconnectAt = now;
+    mqttConnect();
   }
 }
 
@@ -565,6 +734,8 @@ void setup() {
 
   // WiFi
   Serial.printf("连接 WiFi：%s\n", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   int timeout = 0;
@@ -583,7 +754,12 @@ void setup() {
   // MQTT
   mqtt.setServer(MQTT_SERVER, MQTT_PORT);
   mqtt.setCallback(mqttCallback);
-  mqttConnect();
+  mqtt.setKeepAlive(20);
+  mqtt.setSocketTimeout(3);
+  mqtt.setBufferSize(256);
+  if (!mqttConnect()) {
+    Serial.println("[MQTT] 首次连接未完成，将在主循环自动重试");
+  }
 
   Serial.printf("就绪，当前方向：%d\n", currentDir);
 }
@@ -592,8 +768,7 @@ void setup() {
 // 主循环
 // ============================================================
 void loop() {
-  if (!mqtt.connected()) { mqttConnect(); }
-  mqtt.loop();
+  serviceNetwork();
   updateExpressionTimeout();
 
   if (pendingExpression != EXPRESSION_NONE) {
@@ -603,6 +778,7 @@ void loop() {
       ? EXPRESSION_FEEDBACK_MS
       : 0;
     showExpression(expression, duration);
+    publishExpressionAck(expression);
   }
 
   if (pendingTarget != -1) {
@@ -613,5 +789,5 @@ void loop() {
     doTask(target, arrivalExpression);
   }
 
-  delay(10);
+  cooperativeDelay(10);
 }

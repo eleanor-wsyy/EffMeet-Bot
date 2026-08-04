@@ -149,7 +149,7 @@ broker.emqx.io:1883
 | 方向 | 主题 | 用途 |
 | --- | --- | --- |
 | 云端 -> 机器人 | `esp32s3/control` | 移动指令和单独的表情指令 |
-| 机器人 -> 云端 | `esp32s3/status` | 机器人任务完成回包 |
+| 机器人 -> 云端 | `esp32s3/status` | 在线状态、表情确认、完成回包和故障回包 |
 | 云端 -> 上层系统 | `effmeet/cycle/done` | 当前干预序列完成通知 |
 
 ### 移动指令
@@ -227,6 +227,26 @@ done|dir=3|target=1|expression=curious
 payload：cycle_done
 ```
 
+云端会核对 `target` 和 `expression` 是否与当前在途任务一致。重连后迟到的旧 `done` 不会推进新任务。
+
+### 在线、表情确认和故障回包
+
+机器人连接成功后发布保留消息 `online`；意外断线时 Broker 通过 Last Will 把同一主题更新为 `offline`。
+
+单独表情绘制完成后发布：
+
+```text
+ack|type=expression|expression=<表情>|frame=<累计完整帧数>
+```
+
+运动阶段找不到计数线或轨迹并达到安全超时时，机器人立即停止电机、恢复专注表情并发布：
+
+```text
+error|target=<目标编号>|phase=<失败阶段>
+```
+
+云端收到 `error` 后会自动解除忙状态，并撤销本次未完成的干预计数，不需要人工杀后台。云端等待 `done` 超过 180 秒也会自动恢复。
+
 ### 典型消息时序
 
 某人第 1 次被干预：
@@ -263,6 +283,7 @@ EffMeet-Bot/
 │  ├─ main.py                        # 模块化版本入口
 │  ├─ config.yaml                    # 模块化入口的 MQTT 和调度参数
 │  ├─ requirements.txt               # Python 依赖
+│  ├─ templates/dashboard.html        # 实验控制台和下一组按钮
 │  ├─ check_status.py                # 终端状态查看器
 │  ├─ list_mics.py                   # 列出本机输入设备
 │  ├─ core/
@@ -276,7 +297,8 @@ EffMeet-Bot/
 │  ├─ utils/
 │  │  ├─ audio_buffer.py             # 音频缓冲与 VAD 过滤
 │  │  └─ report_gen.py               # Excel 报表生成
-│  └─ test_*.py                      # 联调和行为测试
+│  ├─ test_hardware_stability.py      # 4 种表情 + 连续 5 次往返验收
+│  └─ test_*.py                       # 其他联调和行为测试
 ├─ robot_esp32/
 │  └─ 1.3/
 │     ├─ 1.3.ino                     # ESP32-S3 机器人固件
@@ -287,7 +309,9 @@ EffMeet-Bot/
 │     ├─ reminder.png                # 提醒表情预览
 │     ├─ curious.png                 # 好奇表情预览
 │     ├─ stable.png                  # 稳定表情预览
-│     └─ User_Setup.h                # TFT 配置参考
+│     └─ User_Setup.h                 # Arduino_GFX 实际接线参考
+├─ scripts/start_effmeet.ps1          # 后台复用/自动启动脚本
+├─ 启动实验控制台.bat                 # 双击入口
 ├─ README.md
 └─ READ.me
 ```
@@ -321,13 +345,16 @@ MIC_GAIN_OFFSETS_DB = {
 
 1. 将状态设为忙碌，并显示专注表情。
 2. 根据当前朝向和目标编号计算需要旋转的步数。
-3. 对线后巡线前往目标。
-4. 到达后停止，显示指定的提醒或好奇表情。
+3. 对线后巡线前往目标；全程持续服务 MQTT 保活。
+4. 到达后停止，硬复位 TFT 并完整显示指定的提醒或好奇表情。
 5. 停留 4 秒。
 6. 恢复专注表情，原地掉头并巡线返回起点。
-7. 更新当前朝向。
-8. 发布 `done` 回包。
-9. 解除忙碌状态，继续等待下一条指令。
+7. 停止电机，再次复位 TFT 并完整绘制专注表情。
+8. 更新当前朝向。
+9. 发布 `done` 回包；若当时断线则暂存，重连后自动补发。
+10. 解除忙碌状态，继续等待下一条指令。
+
+TFT 使用整屏地址窗口连续写入 480×320 像素，不再逐像素重复设置地址。该改动显著缩短刷新时间，避免网络保活被长时间占用，也降低只完成半屏刷新的概率。
 
 ## 运行环境
 
@@ -395,10 +422,27 @@ python list_mics.py
 - MQTT Broker 和主题与云端一致。
 - 开发板选择 ESP32-S3。
 - Arduino 库版本与上方验证版本一致。
+- TFT `RST` 接在 **IO42**。旧说明中的 IO33 已废弃，不能继续按旧表接线。
 
 烧录后通过串口确认 Wi-Fi、MQTT 和 TFT 初始化成功。
 
-### 5. 启动云端主程序
+### 5. 一键启动实验控制台（推荐）
+
+直接双击仓库根目录的：
+
+```text
+启动实验控制台.bat
+```
+
+脚本会先检查后台是否已经运行：
+
+- 已运行：直接复用，不会结束或重复启动后台。
+- 未运行：自动使用 `cloud_brain/.venv`（若存在）启动 `main_brain.py`，等待就绪后打开浏览器。
+- 启动日志：保存在 `cloud_brain/data/logs/`。
+
+控制台地址为 <http://127.0.0.1:5000/>。
+
+### 6. 手动启动（备用）
 
 ```powershell
 cd cloud_brain
@@ -411,7 +455,7 @@ python main_brain.py
 [READY] 系统全部就绪，等待发言数据...
 ```
 
-### 6. 查看实时状态
+### 7. 查看实时状态
 
 另开一个终端：
 
@@ -419,6 +463,20 @@ python main_brain.py
 cd cloud_brain
 python check_status.py
 ```
+
+也可以直接保持浏览器中的实验控制台打开，它每 2 秒刷新 4 人发言时长、干预次数、MQTT 和机器人状态。
+
+## 连续多组 4 人实验
+
+后台在整场测试期间只启动一次，不需要在每组实验前杀进程。
+
+1. 完成当前 4 人实验，等待机器人回到起点，控制台显示“空闲”。
+2. 点击“归档并开始下一组”。
+3. 系统先把当前组数据写入 `cloud_brain/data/sessions/session_<组编号>.json`。
+4. 写入成功后，发言时长、转写记录、干预次数和最近事件同时归零。
+5. 调度检查倒计时从完整的 120 秒重新开始，机器人切回专注表情。
+
+若机器人仍在执行任务，按钮会被禁用，接口也会返回 `409`，从而避免上一组的返程或转写混入下一组。已经在后台处理的旧语音带有实验组编号，即使稍后才转写完成也会被自动丢弃。
 
 ## 调试参数
 
@@ -453,6 +511,19 @@ GET http://127.0.0.1:5000/api/get_meeting_data
 - `latest_records`
 - `latest_speaking_events`
 - `latest_audio_state`
+- `session_id` / `session_started_at`
+- `intervention_counts`
+- `robot_busy` / `mqtt_connected` / `robot_online`
+- `next_schedule_check_at`
+
+其他本地接口：
+
+```text
+GET  http://127.0.0.1:5000/api/health
+POST http://127.0.0.1:5000/api/session/reset
+```
+
+`POST /api/session/reset` 等价于控制台按钮：先归档，再开始干净的新实验组。
 
 ## 测试与联调
 
@@ -492,6 +563,25 @@ effmeet/cycle/done
 向 esp32s3/status 发布：done|dir=2|target=3|expression=reminder
 ```
 
+### 现场连续 5 轮稳定性验收
+
+烧录机器人、放到轨道起点并确认周围安全后运行：
+
+```powershell
+cd cloud_brain
+python test_hardware_stability.py
+```
+
+脚本先依次显示专注、提醒、好奇、稳定，每个表情都等待机器人返回带帧号的 `ack`；随后默认执行 `1 → 2 → 3 → 4 → 1` 共 5 次完整往返，并逐次核对 `done` 的目标和表情。结果保存到 `cloud_brain/data/hardware_tests/`。
+
+只检查 4 种表情、不移动机器人：
+
+```powershell
+python test_hardware_stability.py --expression-only
+```
+
+软件只能确认整帧绘制函数执行完毕和 MQTT 链路未断；正式验收仍需现场观察每次是否完整覆盖整块屏幕。
+
 ### 其他测试
 
 - `test_local_mic.py`：本地麦克风和 VAD。
@@ -509,10 +599,11 @@ effmeet/cycle/done
 
 ## 注意事项
 
-- 机器人端任务是阻塞执行的。任务期间不要连续发送新的控制指令。
-- 干预次数保存在云端内存中，云端重启后归零。
+- 机器人执行任务期间会持续维护 MQTT，但不会接受新的移动或表情指令；云端会等待 `done` 后再调度。
+- 干预次数按实验组保存在云端内存；点击“归档并开始下一组”或重启云端后归零。
 - 机器人重启不会自动恢复云端的干预计数；表情等级始终由云端 payload 决定。
 - `expr:stable` 会自动恢复专注；直接发送 `expr:reminder` 或 `expr:curious` 不会自动恢复。
+- TFT 复位脚必须接 IO42。若修复后仍在电机启停时出现花屏/半屏，需要检查屏幕和电机供电压降、共地、接头松动及电机端抑制干扰；软件会在电机停止后自动复位并重绘，但无法补偿持续的硬件掉电。
 - 首次运行 Faster-Whisper 和 Torch 时可能需要下载模型缓存。
 - `cloud_brain/core/speaker_id.py` 和 `cloud_brain/logic/commander.py` 当前为预留模块。
 
@@ -522,6 +613,6 @@ effmeet/cycle/done
 2. 确认机器人已连接 Wi-Fi 和 MQTT。
 3. 给 4 路麦克风设置正确名称。
 4. 运行 `python list_mics.py` 检查设备。
-5. 启动 `python main_brain.py`。
-6. 运行 `python check_status.py` 观察统计。
-7. 在 MQTTX 中订阅控制、状态和周期完成主题进行联调。
+5. 双击 `启动实验控制台.bat`，等待浏览器显示云端和机器人均在线。
+6. 在控制台观察统计；每组结束后点击“归档并开始下一组”。
+7. 正式实验前运行 `python test_hardware_stability.py`，现场完成连续 5 轮验收。

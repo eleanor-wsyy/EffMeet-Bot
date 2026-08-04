@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EffMeet 实验控制台</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+      background: #f4f5f7;
+      color: #172033;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { width: min(980px, calc(100% - 32px)); margin: 32px auto; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    .subtitle { margin: 0 0 24px; color: #637083; }
+    .panel {
+      background: white;
+      border: 1px solid #e1e5eb;
+      border-radius: 14px;
+      padding: 20px;
+      margin-bottom: 16px;
+      box-shadow: 0 6px 24px rgba(20, 32, 51, .06);
+    }
+    .status-row, .nodes { display: grid; gap: 12px; }
+    .status-row { grid-template-columns: repeat(4, 1fr); }
+    .nodes { grid-template-columns: repeat(4, 1fr); margin-top: 16px; }
+    .metric { padding: 14px; border-radius: 10px; background: #f7f8fa; }
+    .metric span { display: block; color: #748094; font-size: 13px; margin-bottom: 6px; }
+    .metric strong { display: block; font-size: 19px; overflow-wrap: anywhere; }
+    .node strong { font-size: 25px; }
+    .ok { color: #16794b; }
+    .warn { color: #b25700; }
+    .bad { color: #b42318; }
+    .action { display: flex; gap: 20px; align-items: center; justify-content: space-between; }
+    .action-copy h2 { margin: 0 0 8px; font-size: 20px; }
+    .action-copy p { margin: 0; color: #637083; line-height: 1.6; }
+    button {
+      min-width: 210px;
+      border: 0;
+      border-radius: 10px;
+      padding: 14px 20px;
+      background: #1769e0;
+      color: white;
+      font-size: 16px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:hover { background: #0d58c7; }
+    button:disabled { background: #aab2bf; cursor: not-allowed; }
+    #message { min-height: 24px; margin-top: 14px; font-weight: 700; }
+    .archive { margin-top: 12px; color: #637083; font-size: 13px; overflow-wrap: anywhere; }
+    @media (max-width: 760px) {
+      .status-row, .nodes { grid-template-columns: repeat(2, 1fr); }
+      .action { align-items: stretch; flex-direction: column; }
+      button { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>EffMeet 实验控制台</h1>
+    <p class="subtitle">后台保持运行；每完成一组 4 人实验，只需在这里开始下一组。</p>
+
+    <section class="panel">
+      <div class="status-row">
+        <div class="metric"><span>当前实验组</span><strong id="session">—</strong></div>
+        <div class="metric"><span>云端 MQTT</span><strong id="mqtt">连接中</strong></div>
+        <div class="metric"><span>机器人</span><strong id="robot">读取中</strong></div>
+        <div class="metric"><span>下次结算</span><strong id="next-check">—</strong></div>
+      </div>
+      <div class="nodes" id="nodes"></div>
+      <div class="archive" id="archive">尚未归档上一组。</div>
+    </section>
+
+    <section class="panel action">
+      <div class="action-copy">
+        <h2>结束当前组并开始下一组</h2>
+        <p>点击后会先把当前发言时长、转写和干预次数保存为独立 JSON，再全部清零；调度的 120 秒倒计时也会从头开始。</p>
+      </div>
+      <button id="reset" type="button">归档并开始下一组</button>
+    </section>
+    <div id="message" role="status" aria-live="polite"></div>
+  </main>
+
+  <script>
+    const resetButton = document.querySelector('#reset');
+    const message = document.querySelector('#message');
+    let latest = null;
+
+    function shortSession(id) {
+      if (!id) return '—';
+      return id.replace(/^(\d{8})-(\d{6}).*$/, '$1 $2');
+    }
+
+    function render(data) {
+      latest = data;
+      document.querySelector('#session').textContent = shortSession(data.session_id);
+
+      const mqtt = document.querySelector('#mqtt');
+      mqtt.textContent = data.mqtt_connected ? '已连接' : '已断开';
+      mqtt.className = data.mqtt_connected ? 'ok' : 'bad';
+
+      const robot = document.querySelector('#robot');
+      robot.textContent = !data.robot_online ? '设备离线' : (data.robot_busy ? '执行任务中' : '在线 · 空闲');
+      robot.className = !data.robot_online ? 'bad' : (data.robot_busy ? 'warn' : 'ok');
+      resetButton.disabled = Boolean(data.robot_busy);
+      resetButton.title = data.robot_busy ? '请等待机器人返回起点' : '';
+
+      const remaining = Math.max(0, Math.ceil((data.next_schedule_check_at || 0) - Date.now() / 1000));
+      document.querySelector('#next-check').textContent = remaining ? `${remaining} 秒` : '等待调度';
+
+      const times = data.current_speaking_times || {};
+      const counts = data.intervention_counts || {};
+      document.querySelector('#nodes').innerHTML = [1, 2, 3, 4].map(number => {
+        const key = `node${number}`;
+        const seconds = Number(times[key] || 0).toFixed(1);
+        const count = Number(counts[key] || 0);
+        return `<div class="metric node"><span>${key} · 已干预 ${count} 次</span><strong>${seconds}s</strong></div>`;
+      }).join('');
+
+      document.querySelector('#archive').textContent = data.last_archive_path
+        ? `上一组归档：${data.last_archive_path}`
+        : '尚未归档上一组。';
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch('/api/get_meeting_data', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        render(await response.json());
+      } catch (error) {
+        document.querySelector('#mqtt').textContent = '后台不可用';
+        document.querySelector('#mqtt').className = 'bad';
+        message.textContent = `状态读取失败：${error.message}`;
+        message.className = 'bad';
+      }
+    }
+
+    resetButton.addEventListener('click', async () => {
+      if (latest?.robot_busy) return;
+      const confirmed = window.confirm('确认当前 4 人实验已经结束，并开始下一组吗？当前数据会先归档，不会丢失。');
+      if (!confirmed) return;
+
+      resetButton.disabled = true;
+      message.textContent = '正在归档并清零…';
+      message.className = 'warn';
+      try {
+        const response = await fetch('/api/session/reset', { method: 'POST' });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.message || `HTTP ${response.status}`);
+        message.textContent = `已开始下一组。上一组归档：${result.archive_path}`;
+        message.className = 'ok';
+        await refresh();
+      } catch (error) {
+        message.textContent = error.message;
+        message.className = 'bad';
+        await refresh();
+      }
+    });
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>

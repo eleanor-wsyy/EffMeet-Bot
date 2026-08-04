@@ -1,6 +1,7 @@
 ﻿# -*- coding: utf-8 -*-
 import io
 import argparse
+import json
 import os
 import queue
 import random
@@ -10,11 +11,13 @@ import time
 import traceback
 import wave
 from collections import deque
+from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import paho.mqtt.client as mqtt
 import sounddevice as sd
-from flask import Flask, jsonify
+from flask import Flask, jsonify, render_template
 from faster_whisper import WhisperModel
 
 from core.vad_engine import VADEngine
@@ -72,6 +75,10 @@ MQTT_TOPIC_CYCLE_DONE = "effmeet/cycle/done"
 SILENCE_TIMEOUT = 120
 IMBALANCE_RATIO_THRESHOLD = 0.5
 INTERVENTION_ORDER = [1, 2, 3, 4]
+ROBOT_TASK_TIMEOUT_SECONDS = 180
+
+BASE_DIR = Path(__file__).resolve().parent
+SESSION_ARCHIVE_DIR = BASE_DIR / "data" / "sessions"
 
 # Windows 录音设备需要按这些名字重命名，程序会据此绑定 4 个麦克风。
 NODE_HARDWARE_MAP = ["NODE1_MIC", "NODE2_MIC", "NODE3_MIC", "NODE4_MIC"]
@@ -91,7 +98,19 @@ _active_interventions = []
 _intervention_counts = {f"node{i}": 0 for i in range(1, 5)}
 _cycle_lock = threading.Lock()
 _mqtt_client_ref = None
+_mqtt_connected = threading.Event()
+_robot_online = threading.Event()
+_scheduler_reset_event = threading.Event()
+_robot_task_started_at = 0.0
+_next_schedule_check_at = 0.0
 _whisper_model = None
+
+# 实验分组状态。每次点击“结束并开始下一组”都会归档当前数据并递增 generation，
+# 后台尚未完成的旧语音转写会据此被丢弃，避免串入下一组。
+_session_generation = 0
+_session_id = ""
+_session_started_at = ""
+_last_archive_path = ""
 
 # 每个麦克风各自维护一个音频队列，转写线程从 transcribe_queue 里取完整句子。
 audio_queues = {f"node{i}": queue.Queue() for i in range(1, 5)}
@@ -146,42 +165,182 @@ def apply_demo_state(spec):
     print(f"[DEMO] 已注入发言时长: {updates}")
 
 
-def reset_runtime_state():
-    """Clear all in-memory session state before a fresh run."""
+def _now_iso():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _make_session_id():
+    return datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+
+
+def _session_snapshot_locked(reason):
+    """Build an archive while both state locks are held."""
+    times = dict(speaking_times)
+    return {
+        "schema_version": 1,
+        "session_id": _session_id,
+        "started_at": _session_started_at,
+        "ended_at": _now_iso(),
+        "end_reason": reason,
+        "speaking_times": times,
+        "total_speaking_time": round(sum(times.values()), 3),
+        "intervention_counts": dict(_intervention_counts),
+        "meeting_records": [dict(item) for item in meeting_records],
+        "speaking_events": [dict(item) for item in speaking_events],
+        "latest_audio_state": dict(latest_audio_state),
+    }
+
+
+def _write_session_archive(snapshot):
+    SESSION_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    archive_path = SESSION_ARCHIVE_DIR / f"session_{snapshot['session_id']}.json"
+    temporary_path = archive_path.with_suffix(".json.tmp")
+    temporary_path.write_text(
+        json.dumps(snapshot, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary_path.replace(archive_path)
+    return archive_path
+
+
+def _discard_queued_audio():
+    # 丢掉按钮按下前已进入采集队列、但尚未完成分析的短音频块。
+    for audio_queue in audio_queues.values():
+        while True:
+            try:
+                audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
+
+def reset_runtime_state(archive_current=False, reason="startup", require_idle=False):
+    """Archive the current group, then atomically start a clean experiment group."""
     global _robot_busy, _cycle_index, _active_interventions
+    global _robot_task_started_at, _session_generation
+    global _session_id, _session_started_at, _last_archive_path
 
-    with state_lock:
-        meeting_records.clear()
-        latest_audio_state.clear()
-        speaking_events.clear()
-        for key in speaking_times:
-            speaking_times[key] = 0.0
-
+    archive_path = None
     with _cycle_lock:
-        _robot_busy = False
-        _cycle_index = 0
-        _active_interventions = []
-        for key in _intervention_counts:
-            _intervention_counts[key] = 0
+        if require_idle and _robot_busy:
+            raise RuntimeError("机器人仍在执行任务，请等待它返回起点后再开始下一组。")
 
-    print("[RESET] 会话状态已清空，准备开始新实验。")
+        with state_lock:
+            if archive_current and _session_id:
+                archive_path = _write_session_archive(
+                    _session_snapshot_locked(reason)
+                )
+
+            meeting_records.clear()
+            latest_audio_state.clear()
+            speaking_events.clear()
+            for key in speaking_times:
+                speaking_times[key] = 0.0
+
+            _robot_busy = False
+            _robot_task_started_at = 0.0
+            _cycle_index = 0
+            _active_interventions = []
+            for key in _intervention_counts:
+                _intervention_counts[key] = 0
+
+            _session_generation += 1
+            _session_id = _make_session_id()
+            _session_started_at = _now_iso()
+            _last_archive_path = str(archive_path) if archive_path else ""
+
+    _discard_queued_audio()
+    _scheduler_reset_event.set()
+
+    client = _mqtt_client_ref
+    if client is not None and client.is_connected():
+        client.publish(MQTT_TOPIC_CONTROL, "expr:focus")
+
+    if archive_path:
+        print(f"[SESSION] 上一组已归档：{archive_path}")
+    print(f"[SESSION] 新实验组已开始：{_session_id}")
+    return {
+        "session_id": _session_id,
+        "started_at": _session_started_at,
+        "archive_path": str(archive_path) if archive_path else None,
+    }
+
+
+@app.route("/", methods=["GET"])
+def dashboard():
+    return render_template("dashboard.html")
+
+
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify(
+        {
+            "status": "ok",
+            "session_id": _session_id,
+            "mqtt_connected": _mqtt_connected.is_set(),
+            "robot_online": _robot_online.is_set(),
+        }
+    )
+
+
+@app.route("/api/session/reset", methods=["POST"])
+def reset_session_api():
+    try:
+        result = reset_runtime_state(
+            archive_current=True,
+            reason="operator_started_next_group",
+            require_idle=True,
+        )
+    except RuntimeError as exc:
+        return jsonify({"status": "busy", "message": str(exc)}), 409
+    except OSError as exc:
+        return jsonify(
+            {
+                "status": "error",
+                "message": f"归档写入失败，当前数据未清空：{exc}",
+            }
+        ), 500
+
+    return jsonify(
+        {
+            "status": "success",
+            "message": "上一组已归档，当前统计和干预次数已清零。",
+            **result,
+        }
+    )
 
 
 @app.route("/api/get_meeting_data", methods=["GET"])
 def get_meeting_data():
-    with state_lock:
-        times = dict(speaking_times)
-        total = sum(times.values())
-        return jsonify(
-            {
+    with _cycle_lock:
+        robot_busy = _robot_busy
+        task_started_at = _robot_task_started_at
+        intervention_counts = dict(_intervention_counts)
+        next_check_at = _next_schedule_check_at
+        with state_lock:
+            times = dict(speaking_times)
+            total = sum(times.values())
+            response = {
                 "status": "success",
+                "session_id": _session_id,
+                "session_started_at": _session_started_at,
+                "last_archive_path": _last_archive_path,
                 "current_speaking_times": times,
                 "total_speaking_time": total,
                 "latest_records": meeting_records[-10:],
                 "latest_speaking_events": list(speaking_events)[-10:],
                 "latest_audio_state": dict(latest_audio_state),
+                "intervention_counts": intervention_counts,
+                "robot_busy": robot_busy,
+                "robot_task_elapsed_seconds": (
+                    max(0.0, time.monotonic() - task_started_at)
+                    if robot_busy and task_started_at
+                    else 0.0
+                ),
+                "mqtt_connected": _mqtt_connected.is_set(),
+                "robot_online": _robot_online.is_set(),
+                "next_schedule_check_at": next_check_at,
             }
-        )
+    return jsonify(response)
 
 
 def get_whisper_model():
@@ -231,6 +390,12 @@ def save_to_wav(audio_frames, filename):
         wf.writeframes(b"".join(audio_frames))
 
 
+def queue_transcription(session_generation, node_name, frames, max_db):
+    transcribe_queue.put(
+        (session_generation, node_name, list(frames), float(max_db))
+    )
+
+
 def find_renamed_microphones():
     # 扫描系统录音设备，只接入命名为 NODE*_MIC 的 4 个麦克风。
     target_mics = {}
@@ -252,22 +417,26 @@ def whisper_worker():
     model = get_whisper_model()
 
     while True:
-        node_name, frames, max_db = transcribe_queue.get()
-        temp_file = f"temp_audio/{node_name}_{int(time.time())}.wav"
+        session_generation, node_name, frames, max_db = transcribe_queue.get()
+        temp_file = f"temp_audio/{node_name}_{time.time_ns()}.wav"
         save_to_wav(frames, temp_file)
         try:
             segments, _info = model.transcribe(temp_file, beam_size=5)
             text = "".join(seg.text for seg in segments).strip()
             if text:
-                print(f"[转写] {node_name}: {text}")
-                meeting_records.append(
-                    {
-                        "node": node_name,
-                        "time": time.strftime("%H:%M:%S"),
-                        "text": text,
-                        "decibel": round(float(max_db), 1),
-                    }
-                )
+                with state_lock:
+                    if session_generation != _session_generation:
+                        print(f"[转写] 丢弃上一实验组的延迟结果：{node_name}")
+                    else:
+                        print(f"[转写] {node_name}: {text}")
+                        meeting_records.append(
+                            {
+                                "node": node_name,
+                                "time": time.strftime("%H:%M:%S"),
+                                "text": text,
+                                "decibel": round(float(max_db), 1),
+                            }
+                        )
         finally:
             try:
                 os.remove(temp_file)
@@ -277,37 +446,136 @@ def whisper_worker():
 
 def _send_next_intervention(client):
     # 同时下发目标座位与本次到达后需要展示的表情。
+    global _robot_task_started_at
     target, expression = _active_interventions[_cycle_index]
     payload = f"move:{target}:{expression}"
-    client.publish(MQTT_TOPIC_CONTROL, payload)
+    publish_info = client.publish(MQTT_TOPIC_CONTROL, payload)
+    if publish_info.rc != mqtt.MQTT_ERR_SUCCESS:
+        print(f"[发送失败] MQTT rc={publish_info.rc}，未下发：{payload}")
+        return False
+
+    _robot_task_started_at = time.monotonic()
     print(
         f"[发送] -> {MQTT_TOPIC_CONTROL}: '{payload}' "
         f"（{_cycle_index + 1}/{len(_active_interventions)}）"
     )
     sys.stdout.flush()
+    return True
+
+
+def _parse_status_fields(payload):
+    fields = {}
+    for part in payload.split("|")[1:]:
+        if "=" in part:
+            key, value = part.split("=", 1)
+            fields[key.strip()] = value.strip()
+    return fields
 
 
 def _on_robot_done(client, msg_payload):
     # 收到机器人 done 消息后推进调度序列；一轮结束后广播 cycle_done。
-    global _robot_busy, _cycle_index
+    global _robot_busy, _cycle_index, _robot_task_started_at
     print(f"[接收] <- {MQTT_TOPIC_STATUS}: '{msg_payload}'")
 
     with _cycle_lock:
+        if not _robot_busy or not _active_interventions:
+            print("[忽略] 当前没有在途任务，这是一条过期的 done。")
+            return
+
+        expected_target, expected_expression = _active_interventions[_cycle_index]
+        fields = _parse_status_fields(msg_payload)
+        if fields.get("target") and fields["target"] != str(expected_target):
+            print(
+                f"[忽略] done 目标不匹配：期待 {expected_target}，"
+                f"收到 {fields['target']}。"
+            )
+            return
+        if fields.get("expression") and fields["expression"] != expected_expression:
+            print(
+                f"[忽略] done 表情不匹配：期待 {expected_expression}，"
+                f"收到 {fields['expression']}。"
+            )
+            return
+
         _cycle_index += 1
         if _cycle_index >= len(_active_interventions):
             _cycle_index = 0
             _robot_busy = False
+            _robot_task_started_at = 0.0
+            _active_interventions.clear()
             client.publish(MQTT_TOPIC_CYCLE_DONE, "cycle_done")
             print(f"[完成] 本轮干预结束，已发布 {MQTT_TOPIC_CYCLE_DONE}。")
         else:
             print("[下一步] 机器人已完成，继续发送下一个干预目标。")
-            _send_next_intervention(client)
+            if not _send_next_intervention(client):
+                _robot_busy = False
+                _robot_task_started_at = 0.0
+                _active_interventions.clear()
 
     sys.stdout.flush()
 
 
+def _on_robot_error(msg_payload):
+    global _robot_busy, _cycle_index, _robot_task_started_at
+    print(f"[机器人故障] <- {MQTT_TOPIC_STATUS}: '{msg_payload}'")
+    fields = _parse_status_fields(msg_payload)
+
+    with _cycle_lock:
+        if not _robot_busy or not _active_interventions:
+            return
+        expected_target, _expression = _active_interventions[_cycle_index]
+        if fields.get("target") and fields["target"] != str(expected_target):
+            return
+
+        node = f"node{expected_target}"
+        if _intervention_counts[node] > 0:
+            _intervention_counts[node] -= 1
+        _robot_busy = False
+        _robot_task_started_at = 0.0
+        _cycle_index = 0
+        _active_interventions.clear()
+
+    sys.stdout.flush()
+
+
+def robot_watchdog_worker():
+    """Release a lost in-flight task promptly instead of waiting for the next schedule."""
+    global _robot_busy, _cycle_index, _robot_task_started_at
+
+    while True:
+        time.sleep(1)
+        timed_out = False
+        with _cycle_lock:
+            if not _robot_busy or not _robot_task_started_at or not _active_interventions:
+                continue
+            elapsed = time.monotonic() - _robot_task_started_at
+            if elapsed < ROBOT_TASK_TIMEOUT_SECONDS:
+                continue
+
+            target = _active_interventions[_cycle_index][0]
+            node = f"node{target}"
+            if _intervention_counts[node] > 0:
+                _intervention_counts[node] -= 1
+            _robot_busy = False
+            _robot_task_started_at = 0.0
+            _cycle_index = 0
+            _active_interventions.clear()
+            timed_out = True
+
+        if timed_out:
+            client = _mqtt_client_ref
+            if client is not None and client.is_connected():
+                client.publish(MQTT_TOPIC_CONTROL, "expr:focus")
+            print(
+                f"[超时恢复] 机器人任务超过 {ROBOT_TASK_TIMEOUT_SECONDS}s，"
+                "已解除忙状态；不会再要求人工杀后台。"
+            )
+            sys.stdout.flush()
+
+
 def mqtt_monitor_worker(schedule_interval):
     global _robot_busy, _cycle_index, _mqtt_client_ref
+    global _robot_task_started_at, _next_schedule_check_at
 
     client_id = "EffMeet_Brain_" + str(random.randint(10000, 99999))
     client = mqtt.Client(client_id=client_id)
@@ -316,32 +584,62 @@ def mqtt_monitor_worker(schedule_interval):
 
     def on_connect(c, userdata, flags, rc):
         if rc == 0:
+            _mqtt_connected.set()
             c.subscribe(MQTT_TOPIC_STATUS)
             c.publish(MQTT_TOPIC_CONTROL, "expr:focus")
             print(f"[MQTT] 已连接 Broker，并订阅机器人状态主题：{MQTT_TOPIC_STATUS}")
             print("[MQTT] 已下发等待表情：expr:focus")
         else:
+            _mqtt_connected.clear()
             print(f"[MQTT] 连接异常，返回码：{rc}")
+        sys.stdout.flush()
+
+    def on_disconnect(c, userdata, rc):
+        _mqtt_connected.clear()
+        print(f"[MQTT] 连接已断开 rc={rc}，后台将自动重连。")
         sys.stdout.flush()
 
     def on_message(c, userdata, msg):
         payload = msg.payload.decode("utf-8", errors="ignore").strip()
-        if payload.startswith("done"):
+        if payload == "online":
+            _robot_online.set()
+            print("[机器人] 设备在线。")
+        elif payload == "offline":
+            _robot_online.clear()
+            print("[机器人] 设备离线。")
+        elif payload.startswith("done"):
+            _robot_online.set()
             _on_robot_done(c, payload)
+        elif payload.startswith("error"):
+            _robot_online.set()
+            _on_robot_error(payload)
+        elif payload.startswith("ack"):
+            _robot_online.set()
 
     client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
     client.on_message = on_message
 
     try:
-        client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        client.reconnect_delay_set(min_delay=1, max_delay=30)
+        client.connect_async(MQTT_BROKER, MQTT_PORT, 60)
         client.loop_start()
-        print("[MQTT] 机器人调度线程已上线。")
+        print("[MQTT] 机器人调度线程已上线，将持续自动重连。")
     except Exception as e:
         print(f"[MQTT] 连接失败：{e}")
         return
 
     while True:
-        time.sleep(schedule_interval)
+        _next_schedule_check_at = time.time() + schedule_interval
+        if _scheduler_reset_event.wait(schedule_interval):
+            _scheduler_reset_event.clear()
+            print("[调度] 已开始新实验组，检查倒计时重新计算。")
+            continue
+
+        if not _mqtt_connected.is_set() or not _robot_online.is_set():
+            print("[调度] MQTT 或机器人尚未在线，本轮不结算，避免生成无法执行的任务。")
+            continue
+
         with _cycle_lock:
             if _robot_busy:
                 print("[调度] 机器人正在执行任务，等待下一轮检查。")
@@ -378,7 +676,11 @@ def mqtt_monitor_worker(schedule_interval):
                     f"表情={expression}"
                 )
                 print(f"[触发] 本轮干预：{_active_interventions}")
-                _send_next_intervention(client)
+                if not _send_next_intervention(client):
+                    _intervention_counts[candidate_node] -= 1
+                    _robot_busy = False
+                    _robot_task_started_at = 0.0
+                    _active_interventions.clear()
             else:
                 client.publish(MQTT_TOPIC_CONTROL, "expr:stable")
                 print(
@@ -403,9 +705,20 @@ def brain_worker():
     max_db_in_sentence = 0
     last_debug_print = 0
     noise_floor = calibrate_noise_floor()
+    with state_lock:
+        worker_session_generation = _session_generation
 
     print("[大脑] 音频监听与分析线程已启动。")
     while True:
+        with state_lock:
+            active_session_generation = _session_generation
+        if worker_session_generation != active_session_generation:
+            current_speaker = None
+            audio_buffer = []
+            silence_ticks = 0
+            max_db_in_sentence = 0
+            worker_session_generation = active_session_generation
+
         if all(not q.empty() for q in audio_queues.values()):
             chunks = {n: q.get() for n, q in audio_queues.items()}
             db_values = {n: get_decibels(chunks[n]) for n in audio_queues}
@@ -457,6 +770,8 @@ def brain_worker():
                 decision = f"计时：{winner_node} +{CHUNK_DURATION:.1f}s"
 
             with state_lock:
+                if worker_session_generation != _session_generation:
+                    continue
                 latest_audio_state.clear()
                 latest_audio_state.update(
                     {
@@ -478,6 +793,8 @@ def brain_worker():
 
             if is_speaking:
                 with state_lock:
+                    if worker_session_generation != _session_generation:
+                        continue
                     speaking_times[winner_node] += CHUNK_DURATION
                     speaking_events.append(
                         {
@@ -494,7 +811,12 @@ def brain_worker():
                 # 说话人变化时，把上一位说话人的缓存片段送去转写。
                 if current_speaker != winner_node:
                     if current_speaker and len(audio_buffer) > 1:
-                        transcribe_queue.put((current_speaker, audio_buffer, max_db_in_sentence))
+                        queue_transcription(
+                            worker_session_generation,
+                            current_speaker,
+                            audio_buffer,
+                            max_db_in_sentence,
+                        )
                     current_speaker = winner_node
                     audio_buffer = [chunks[winner_node]]
                     max_db_in_sentence = max_db
@@ -507,7 +829,12 @@ def brain_worker():
                 if silence_ticks > 3 and current_speaker is not None:
                     # 连续静音后认为一句话结束，将缓存音频交给转写线程。
                     if len(audio_buffer) > 1:
-                        transcribe_queue.put((current_speaker, audio_buffer, max_db_in_sentence))
+                        queue_transcription(
+                            worker_session_generation,
+                            current_speaker,
+                            audio_buffer,
+                            max_db_in_sentence,
+                        )
                     current_speaker = None
                     audio_buffer = []
         else:
@@ -555,11 +882,12 @@ def main():
                 return
 
     threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False),
+        target=lambda: app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False),
         daemon=True,
     ).start()
     threading.Thread(target=whisper_worker, daemon=True).start()
     threading.Thread(target=mqtt_monitor_worker, args=(SILENCE_TIMEOUT,), daemon=True).start()
+    threading.Thread(target=robot_watchdog_worker, daemon=True).start()
     if not args.no_mic:
         threading.Thread(target=brain_worker, daemon=True).start()
 

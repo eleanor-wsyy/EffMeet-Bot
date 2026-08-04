@@ -14,6 +14,9 @@ temp_audio/
 cloud_brain/temp_audio/
 data/profiles/*
 data/logs/*
+cloud_brain/data/logs/*
+cloud_brain/data/sessions/*
+cloud_brain/data/hardware_tests/*
 *.wav
 *.pcm
 *.mp3
@@ -31,3 +34,6 @@ robot_esp32/**/secrets.h
 .claude/
 .agents/
 .codex/
+
+# 本地 Arduino CLI 编译缓存和 ASCII 路径配置
+work/
