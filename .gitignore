@@ -36,5 +36,12 @@ robot_esp32/**/secrets.h
 .agents/
 .codex/
 
+# PyInstaller 打包产物
+build/
+dist/
+cloud_brain/build/
+cloud_brain/dist/
+*.spec.bak
+
 # 本地 Arduino CLI 编译缓存和 ASCII 路径配置
 work/
