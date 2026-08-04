@@ -21,6 +21,7 @@ import sounddevice as sd
 from flask import Flask, jsonify, render_template, request
 from faster_whisper import WhisperModel
 
+from core.activity_engine import ActivityEngine
 from core.vad_engine import VADEngine
 from experiment_recording import ExperimentRecorder, RecordingError
 
@@ -59,6 +60,18 @@ ABSOLUTE_DB_FLOOR = 45.0
 SPEECH_ABOVE_NOISE_DB = 10.0
 WINNER_MARGIN_DB = 4.0
 USE_VAD = True
+
+# robust 模式下的判定参数（见 判定改进设计.md）。
+SPEECH_HI_DB = 10.0          # 双门限开口高门限（相对底噪）
+SPEECH_LO_DB = 6.0           # 双门限维持低门限（相对底噪）
+FLOOR_ALPHA = 0.03           # 自适应底噪时间常数
+VAD_MAX_SIL = 3              # 全局 VAD 静音容忍块数
+DOM_HANGOVER = 3             # 主导者静音容忍块数（说话停顿不误停）
+DOM_LEAD_CONFIRM = 2         # 主导者接管前需持续块数（防单块误占）
+DETECT_MODE = "robust"       # 说话人判定模式：robust / legacy
+
+# robust 判定引擎（惰性创建，避免 --smoke 时生成）。
+_activity_engine = None
 
 # 麦克风灵敏度补偿。某一路长期偏小就填正数，长期偏大就填负数。
 MIC_GAIN_OFFSETS_DB = {
@@ -160,6 +173,13 @@ def parse_args(argv):
         type=str,
         default="",
         help="Seed speaking times, e.g. node1=100,node2=10,node3=0,node4=15.",
+    )
+    parser.add_argument(
+        "--detect-mode",
+        type=str,
+        choices=["robust", "legacy"],
+        default=DETECT_MODE,
+        help="说话人判定模式：robust 使用自适应底噪+主导说话人+静音容忍；legacy 保留旧瞬时判定。",
     )
     return parser.parse_args(argv)
 
@@ -279,6 +299,10 @@ def reset_runtime_state(
 
     _discard_queued_audio()
     _scheduler_reset_event.set()
+
+    # 新实验组归零判定归属/活动状态（保留自适应底噪）。
+    if _activity_engine is not None:
+        _activity_engine.reset()
 
     client = _mqtt_client_ref
     if client is not None and client.is_connected():
@@ -1159,6 +1183,8 @@ def brain_worker():
     max_db_in_sentence = 0
     last_debug_print = 0
     noise_floor = calibrate_noise_floor()
+    if _activity_engine is not None:
+        _activity_engine.set_floor(noise_floor)
     with state_lock:
         worker_session_generation = _session_generation
 
@@ -1197,132 +1223,224 @@ def brain_worker():
         chunks = dequeue_aligned_audio_chunks()
         if chunks is not None:
             db_values = {n: get_decibels(chunks[n]) for n in audio_queues}
-            score_values = {
-                n: db_values[n] - noise_floor[n] + MIC_GAIN_OFFSETS_DB.get(n, 0.0)
-                for n in audio_queues
-            }
-            ranked_nodes = sorted(score_values, key=score_values.get, reverse=True)
-            winner_node = ranked_nodes[0]
-            runner_up_node = ranked_nodes[1] if len(ranked_nodes) > 1 else winner_node
-            max_db = db_values[winner_node]
-            max_score = score_values[winner_node]
-            runner_up_score = score_values[runner_up_node]
-            winner_gap = max_score - runner_up_score
 
-            # 每隔 2 秒打印一次分贝，便于现场校准麦克风阈值。
-            now = time.time()
-            if now - last_debug_print >= 2:
-                db_text = " ".join(f"{n}={db_values[n]:.1f}dB" for n in sorted(db_values))
-                score_text = " ".join(f"{n}={score_values[n]:+.1f}" for n in sorted(score_values))
-                print(
-                    f"[分贝] {db_text} | 相对分={score_text} | "
-                    f"候选={winner_node} 绝对={max_db:.1f}dB 相对={max_score:.1f}dB "
-                    f"领先={winner_gap:.1f}dB"
-                )
-                last_debug_print = now
-
-            # VAD 可用时叠加人声判断；VAD 初始化失败时退回到纯分贝判断。
-            vad_passed = True if vad_engine is None else vad_engine.is_speech(chunks[winner_node])
-            is_speaking = (
-                max_db > ABSOLUTE_DB_FLOOR
-                and max_score > SPEECH_ABOVE_NOISE_DB
-                and winner_gap >= WINNER_MARGIN_DB
-                and vad_passed
-            )
-
-            if not is_speaking:
-                if max_db <= ABSOLUTE_DB_FLOOR:
-                    decision = f"未计时：绝对分贝 {max_db:.1f}dB 低于 {ABSOLUTE_DB_FLOOR:.1f}dB"
-                elif max_score <= SPEECH_ABOVE_NOISE_DB:
-                    decision = f"未计时：相对底噪 {max_score:.1f}dB 低于 {SPEECH_ABOVE_NOISE_DB:.1f}dB"
-                elif winner_gap < WINNER_MARGIN_DB:
-                    decision = f"未计时：领先差 {winner_gap:.1f}dB 小于 {WINNER_MARGIN_DB:.1f}dB，疑似串音"
-                elif not vad_passed:
-                    decision = "未计时：VAD 未判定为人声"
-                else:
-                    decision = "未计时"
-            else:
-                decision = f"计时：{winner_node} +{CHUNK_DURATION:.1f}s"
-
-            with state_lock:
-                if worker_session_generation != _session_generation:
-                    continue
-                latest_audio_state.clear()
-                latest_audio_state.update(
-                    {
-                        "time": time.strftime("%H:%M:%S"),
-                        "candidate": winner_node,
-                        "runner_up": runner_up_node,
-                        "candidate_db": round(float(max_db), 1),
-                        "candidate_score": round(float(max_score), 1),
-                        "runner_up_score": round(float(runner_up_score), 1),
-                        "winner_gap": round(float(winner_gap), 1),
-                        "vad_passed": bool(vad_passed),
-                        "is_speaking": bool(is_speaking),
-                        "decision": decision,
-                        "db_values": {n: round(float(v), 1) for n, v in db_values.items()},
-                        "score_values": {n: round(float(v), 1) for n, v in score_values.items()},
-                        "noise_floor": {n: round(float(v), 1) for n, v in noise_floor.items()},
-                    }
-                )
-
-            if is_speaking:
+            # robust 模式：自适应底噪 + 主导说话人 + 静音容忍。
+            # 只复用最紧凑的输出（dom / count），转写片段与上报沿用下方通用逻辑。
+            if _activity_engine is not None and DETECT_MODE == "robust":
+                res = _activity_engine.update(db_values)
+                winner_node = res["dom"]
+                is_speaking = res["count"]
+                decision = "计时：" + (winner_node or "?") + f" +{CHUNK_DURATION:.1f}s" \
+                    if is_speaking else \
+                    ("未计时：整场静音" if not res["vad_active"] else "未计时：主导者未确认")
+                max_db = db_values.get(winner_node, -80.0) if winner_node else -80.0
+                max_score = res["snr"].get(winner_node, 0.0) if winner_node else 0.0
+                runner_up_node = None
+                runner_up_score = 0.0
+                winner_gap = 0.0
                 with state_lock:
                     if worker_session_generation != _session_generation:
                         continue
-                    speaking_times[winner_node] += CHUNK_DURATION
-                    speaking_events.append(
+                    latest_audio_state.clear()
+                    latest_audio_state.update(
                         {
                             "time": time.strftime("%H:%M:%S"),
-                            "node": winner_node,
-                            "add_seconds": CHUNK_DURATION,
-                            "total_seconds": round(float(speaking_times[winner_node]), 1),
+                            "mode": "robust",
+                            "candidate": winner_node,
+                            "dom": winner_node,
+                            "vad_active": bool(res["vad_active"]),
+                            "is_speaking": bool(is_speaking),
+                            "decision": decision,
+                            "db_values": {n: round(float(v), 1) for n, v in db_values.items()},
+                            "snr": dict(res["snr"]),
+                            "noise_floor": dict(res["floor"]),
+                        }
+                    )
+                if is_speaking:
+                    with state_lock:
+                        if worker_session_generation != _session_generation:
+                            continue
+                        speaking_times[winner_node] += CHUNK_DURATION
+                        speaking_events.append(
+                            {
+                                "time": time.strftime("%H:%M:%S"),
+                                "node": winner_node,
+                                "add_seconds": CHUNK_DURATION,
+                                "total_seconds": round(float(speaking_times[winner_node]), 1),
+                                "mode": "robust",
+                            }
+                        )
+                    if current_speaker != winner_node:
+                        if current_speaker and len(audio_buffer) > 1:
+                            queue_transcription(
+                                worker_session_generation,
+                                current_speaker,
+                                audio_buffer,
+                                max_db_in_sentence,
+                            )
+                        current_speaker = winner_node
+                        audio_buffer = [chunks[winner_node]]
+                        max_db_in_sentence = max_db
+                    else:
+                        audio_buffer.append(chunks[winner_node])
+                        max_db_in_sentence = max(max_db_in_sentence, max_db)
+                    silence_ticks = 0
+                else:
+                    silence_ticks += 1
+                    if silence_ticks > 3 and current_speaker is not None:
+                        if len(audio_buffer) > 1:
+                            queue_transcription(
+                                worker_session_generation,
+                                current_speaker,
+                                audio_buffer,
+                                max_db_in_sentence,
+                            )
+                        current_speaker = None
+                        audio_buffer = []
+            else:
+                # legacy / 引擎不可用：走旧的瞬时判定。
+                score_values = {
+                    n: db_values[n] - noise_floor[n] + MIC_GAIN_OFFSETS_DB.get(n, 0.0)
+                    for n in audio_queues
+                }
+                ranked_nodes = sorted(score_values, key=score_values.get, reverse=True)
+                winner_node = ranked_nodes[0]
+                runner_up_node = ranked_nodes[1] if len(ranked_nodes) > 1 else winner_node
+                max_db = db_values[winner_node]
+                max_score = score_values[winner_node]
+                runner_up_score = score_values[runner_up_node]
+                winner_gap = max_score - runner_up_score
+
+                # 每隔 2 秒打印一次分贝，便于现场校准麦克风阈值。
+                now = time.time()
+                if now - last_debug_print >= 2:
+                    db_text = " ".join(f"{n}={db_values[n]:.1f}dB" for n in sorted(db_values))
+                    score_text = " ".join(f"{n}={score_values[n]:+.1f}" for n in sorted(score_values))
+                    print(
+                        f"[分贝] {db_text} | 相对分={score_text} | "
+                        f"候选={winner_node} 绝对={max_db:.1f}dB 相对={max_score:.1f}dB "
+                        f"领先={winner_gap:.1f}dB"
+                    )
+                    last_debug_print = now
+
+                # VAD 可用时叠加人声判断；VAD 初始化失败时退回到纯分贝判断。
+                vad_passed = True if vad_engine is None else vad_engine.is_speech(chunks[winner_node])
+                is_speaking = (
+                    max_db > ABSOLUTE_DB_FLOOR
+                    and max_score > SPEECH_ABOVE_NOISE_DB
+                    and winner_gap >= WINNER_MARGIN_DB
+                    and vad_passed
+                )
+
+                if not is_speaking:
+                    if max_db <= ABSOLUTE_DB_FLOOR:
+                        decision = f"未计时：绝对分贝 {max_db:.1f}dB 低于 {ABSOLUTE_DB_FLOOR:.1f}dB"
+                    elif max_score <= SPEECH_ABOVE_NOISE_DB:
+                        decision = f"未计时：相对底噪 {max_score:.1f}dB 低于 {SPEECH_ABOVE_NOISE_DB:.1f}dB"
+                    elif winner_gap < WINNER_MARGIN_DB:
+                        decision = f"未计时：领先差 {winner_gap:.1f}dB 小于 {WINNER_MARGIN_DB:.1f}dB，疑似串音"
+                    elif not vad_passed:
+                        decision = "未计时：VAD 未判定为人声"
+                    else:
+                        decision = "未计时"
+                else:
+                    decision = f"计时：{winner_node} +{CHUNK_DURATION:.1f}s"
+
+                with state_lock:
+                    if worker_session_generation != _session_generation:
+                        continue
+                    latest_audio_state.clear()
+                    latest_audio_state.update(
+                        {
+                            "time": time.strftime("%H:%M:%S"),
+                            "mode": "legacy",
+                            "candidate": winner_node,
+                            "runner_up": runner_up_node,
                             "candidate_db": round(float(max_db), 1),
                             "candidate_score": round(float(max_score), 1),
+                            "runner_up_score": round(float(runner_up_score), 1),
                             "winner_gap": round(float(winner_gap), 1),
+                            "vad_passed": bool(vad_passed),
+                            "is_speaking": bool(is_speaking),
+                            "decision": decision,
+                            "db_values": {n: round(float(v), 1) for n, v in db_values.items()},
+                            "score_values": {n: round(float(v), 1) for n, v in score_values.items()},
+                            "noise_floor": {n: round(float(v), 1) for n, v in noise_floor.items()},
                         }
                     )
 
-                # 说话人变化时，把上一位说话人的缓存片段送去转写。
-                if current_speaker != winner_node:
-                    if current_speaker and len(audio_buffer) > 1:
-                        queue_transcription(
-                            worker_session_generation,
-                            current_speaker,
-                            audio_buffer,
-                            max_db_in_sentence,
+                if is_speaking:
+                    with state_lock:
+                        if worker_session_generation != _session_generation:
+                            continue
+                        speaking_times[winner_node] += CHUNK_DURATION
+                        speaking_events.append(
+                            {
+                                "time": time.strftime("%H:%M:%S"),
+                                "node": winner_node,
+                                "add_seconds": CHUNK_DURATION,
+                                "total_seconds": round(float(speaking_times[winner_node]), 1),
+                                "candidate_db": round(float(max_db), 1),
+                                "candidate_score": round(float(max_score), 1),
+                                "winner_gap": round(float(winner_gap), 1),
+                            }
                         )
-                    current_speaker = winner_node
-                    audio_buffer = [chunks[winner_node]]
-                    max_db_in_sentence = max_db
+
+                    # 说话人变化时，把上一位说话人的缓存片段送去转写。
+                    if current_speaker != winner_node:
+                        if current_speaker and len(audio_buffer) > 1:
+                            queue_transcription(
+                                worker_session_generation,
+                                current_speaker,
+                                audio_buffer,
+                                max_db_in_sentence,
+                            )
+                        current_speaker = winner_node
+                        audio_buffer = [chunks[winner_node]]
+                        max_db_in_sentence = max_db
+                    else:
+                        audio_buffer.append(chunks[winner_node])
+                        max_db_in_sentence = max(max_db_in_sentence, max_db)
+                    silence_ticks = 0
                 else:
-                    audio_buffer.append(chunks[winner_node])
-                    max_db_in_sentence = max(max_db_in_sentence, max_db)
-                silence_ticks = 0
-            else:
-                silence_ticks += 1
-                if silence_ticks > 3 and current_speaker is not None:
-                    # 连续静音后认为一句话结束，将缓存音频交给转写线程。
-                    if len(audio_buffer) > 1:
-                        queue_transcription(
-                            worker_session_generation,
-                            current_speaker,
-                            audio_buffer,
-                            max_db_in_sentence,
-                        )
-                    current_speaker = None
-                    audio_buffer = []
+                    silence_ticks += 1
+                    if silence_ticks > 3 and current_speaker is not None:
+                        # 连续静音后认为一句话结束，将缓存音频交给转写线程。
+                        if len(audio_buffer) > 1:
+                            queue_transcription(
+                                worker_session_generation,
+                                current_speaker,
+                                audio_buffer,
+                                max_db_in_sentence,
+                            )
+                        current_speaker = None
+                        audio_buffer = []
         else:
             time.sleep(0.01)
 
 
 def main():
     # 程序入口：后台只做就绪准备；明确点击“开始实验”后才打开麦克风录音。
-    global _microphones, _no_mic_mode
+    global _microphones, _no_mic_mode, DETECT_MODE, _activity_engine
     args = parse_args(sys.argv[1:])
     if args.schedule_interval > 0:
         global SILENCE_TIMEOUT
         SILENCE_TIMEOUT = args.schedule_interval
+
+    DETECT_MODE = args.detect_mode
+    if DETECT_MODE == "robust":
+        _activity_engine = ActivityEngine(
+            nodes=sorted({f"node{i}" for i in range(1, 5)}),
+            speech_hi_db=SPEECH_HI_DB,
+            speech_lo_db=SPEECH_LO_DB,
+            floor_alpha=FLOOR_ALPHA,
+            max_sil=VAD_MAX_SIL,
+            hangover=DOM_HANGOVER,
+            lead_confirm=DOM_LEAD_CONFIRM,
+        )
+        print(f"[启动] 说话人判定模式：robust（自适应底噪 + 主导说话人 + 静音容忍）")
+    else:
+        print(f"[启动] 说话人判定模式：legacy（旧瞬时判定，可回退）")
 
     if args.loose_thresholds:
         global ABSOLUTE_DB_FLOOR, SPEECH_ABOVE_NOISE_DB, WINNER_MARGIN_DB
