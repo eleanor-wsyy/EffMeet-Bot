@@ -21,7 +21,7 @@
 #define TFT_D4   10
 #define TFT_D5   11
 #define TFT_D6   12
-#define TFT_D7   19
+#define TFT_D7   18
 
 #define TFT_WIDTH  480
 #define TFT_HEIGHT 320
