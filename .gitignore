@@ -17,6 +17,7 @@ data/logs/*
 cloud_brain/data/logs/*
 cloud_brain/data/sessions/*
 cloud_brain/data/hardware_tests/*
+cloud_brain/data/recording_staging/*
 *.wav
 *.pcm
 *.mp3

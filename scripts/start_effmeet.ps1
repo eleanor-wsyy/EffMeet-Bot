@@ -1,3 +1,7 @@
+param(
+    [switch]$NoBrowser
+)
+
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -58,9 +62,17 @@ if (-not (Test-EffMeetBackend)) {
         if (Test-Path -LiteralPath $stderrLog) {
             Get-Content -LiteralPath $stderrLog -Tail 30
         }
+        if (-not $backend.HasExited) {
+            Stop-Process -Id $backend.Id -Force -ErrorAction SilentlyContinue
+        }
         throw "EffMeet backend startup failed."
     }
 }
 
-Write-Host "EffMeet backend is ready. Opening the experiment dashboard." -ForegroundColor Green
-Start-Process $dashboardUrl
+if (-not $NoBrowser) {
+    Write-Host "EffMeet backend is ready. Opening the experiment dashboard." -ForegroundColor Green
+    Start-Process $dashboardUrl
+}
+else {
+    Write-Host "EffMeet backend is ready. No recording has started." -ForegroundColor Green
+}

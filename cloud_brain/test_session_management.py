@@ -30,7 +30,7 @@ def test_archive_and_reset():
             client = brain.app.test_client()
             dashboard = client.get("/")
             assert dashboard.status_code == 200
-            assert "归档并开始下一组" in dashboard.get_data(as_text=True)
+            assert "明确开始实验" in dashboard.get_data(as_text=True)
 
             response = client.post("/api/session/reset")
             assert response.status_code == 200, response.get_json()
