@@ -304,11 +304,14 @@ EffMeet-Bot/
 │  ├─ main.py                        # 模块化版本入口
 │  ├─ config.yaml                    # 模块化入口的 MQTT 和调度参数
 │  ├─ requirements.txt               # Python 依赖
+│  ├─ EffMeet.spec                   # PyInstaller 打包配置
 │  ├─ templates/dashboard.html        # 明确开始/结束实验控制台
 │  ├─ check_status.py                # 终端状态查看器
 │  ├─ list_mics.py                   # 列出本机输入设备
+│  ├─ check_mics.py                  # 麦克风连接自检（逐个录音测分贝）
 │  ├─ core/
-│  │  ├─ vad_engine.py               # Silero VAD 封装
+│  │  ├─ activity_engine.py          # robust 人声判定状态机（自适应底噪+主导说话人）
+│  │  ├─ vad_engine.py               # Silero VAD 封装（可禁用）
 │  │  └─ speaker_id.py               # 预留模块
 │  ├─ logic/
 │  │  ├─ meeting_state.py            # 模块化会议统计与干预逻辑
@@ -318,6 +321,7 @@ EffMeet-Bot/
 │  ├─ utils/
 │  │  ├─ audio_buffer.py             # 音频缓冲与 VAD 过滤
 │  │  └─ report_gen.py               # Excel 报表生成
+│  ├─ test_activity_engine.py         # robust 人声判定离线测试
 │  ├─ test_hardware_stability.py      # 4 种表情 + 连续 5 次往返验收
 │  ├─ test_experiment_recording.py    # 录音格式、命名、校验和重试测试
 │  ├─ test_experiment_lifecycle.py    # HTTP 开始/结束/自动关后台测试
@@ -344,15 +348,29 @@ EffMeet-Bot/
 
 ## 云端音频判断
 
-`cloud_brain/main_brain.py` 的音频线程会：
+默认（`--detect-mode robust`）的判定由 `cloud_brain/core/activity_engine.py` 的
+`ActivityEngine` 承担，`main_brain.py` 的音频线程逐块喂入 4 路分贝并取出判定结果：
 
 1. 自动识别名称包含 `NODE1_MIC` 到 `NODE4_MIC` 的 4 路输入设备。
-2. 启动时校准每一路麦克风的底噪。
-3. 计算绝对分贝、相对底噪得分和领先差。
-4. 结合 Silero VAD 判断是否为有效人声。
-5. 只给当前最可信的发言节点累计时长。
-6. 将语音片段交给 Faster-Whisper 转写。
+2. 每路维护一个**自适应底噪**，环境噪声漂移时缓慢跟随，不写死一次性校准值。
+3. 全局用**双门限 VAD** 判断"整场是否有持续人声"，带静音容忍（说话中的短暂停顿不误停）。
+4. **主导说话人归属**：只在"确实在说话"的前提下，把连续超阈值且稳定的那路判为主说话人；
+   切换跳转需要持续证据（`lead_confirm`），串音/单个尖峰不会抢归属——因此"捂住麦克风
+   不说话不会乱计时"。
+5. 只给当前主导说话人累计时长，并将分贝/底噪/归属写入 `latest_audio_state` 供排查。
+6. 若开启语音转写（默认 `--no-whisper` 关闭），把语音片段交给 Faster-Whisper 转写。
 7. 通过 Flask 接口暴露当前状态。
+
+判定参数（可调）位于 `main_brain.py` 顶部：
+
+```text
+SPEECH_HI_DB = 10.0     # 双门限开口高门限（相对底噪）
+SPEECH_LO_DB = 6.0      # 双门限维持低门限（相对底噪）
+FLOOR_ALPHA = 0.03      # 自适应底噪时间常数
+VAD_MAX_SIL = 3         # 全局 VAD 静音容忍块数
+DOM_HANGOVER = 3        # 主导者静音容忍块数
+DOM_LEAD_CONFIRM = 2    # 主导者接管前需持续块数
+```
 
 如果某一路麦克风长期偏大或偏小，可调整 `main_brain.py` 中的：
 
@@ -387,9 +405,42 @@ TFT 使用整屏地址窗口连续写入 480×320 像素，不再逐像素重复
 ### 云端
 
 - Windows 10 / 11
-- Python 3.10+
+- Python 3.10+（源码运行）
 - 4 路 USB 麦克风
 - 可访问 MQTT Broker 的网络
+
+> 不想装 Python？可以直接用打包好的 exe（见下节"打包与分发"），双击即启动，目标电脑免装 Python。
+
+### 打包与分发
+
+项目可用 PyInstaller 打成一个免装 Python 的绿色目录（缺省剥离 torch / faster-whisper，
+专注录音 + 人声判定 + 机器人干预）。产物在 `cloud_brain/dist/EffMeet/`：
+
+- `EffMeet.exe` —— 后台主程序（等价 `python main_brain.py --no-whisper --no-vad`）
+- `check_mics.exe` —— 麦克风自检工具
+- 把整个目录拷贝到任意一台 Windows 电脑，双击 `EffMeet.exe` 即启动，浏览器开
+  <http://127.0.0.1:5000/> 使用。
+
+本地重新打包：
+
+```powershell
+cd cloud_brain
+python -m pip install pyinstaller -r requirements_pack.txt   # 见下
+python -m PyInstaller EffMeet.spec --noconfirm --clean
+```
+
+打包环境要求常规 Python（微软商店版 Python 无法被 PyInstaller 打包，请用 python.org 或
+Anaconda 安装版）。`requirements_pack.txt` 提供不含 torch/whisper 的依赖清单：
+`paho-mqtt numpy pandas openpyxl PyYAML sounddevice Flask`。
+
+> 语义：exe 默认剥离 Whisper 转写，但保留录音 + 人声判定 + 机器人干预（robust 判定
+> 不依赖 torch）。若需转写，源码运行上述完整功能，或用 `--no-whisper` 显式关闭。
+
+已发布的可运行版本可从 GitHub Release 下载：
+
+```text
+https://github.com/eleanor-wsyy/EffMeet-Bot/releases
+```
 
 ### 机器人端
 
@@ -433,12 +484,25 @@ python -m pip install -r requirements.txt
 
 ### 3. 检查麦克风
 
+先 `list_mics.py` 列出输入设备：
+
 ```powershell
 cd cloud_brain
 python list_mics.py
 ```
 
-确认程序能识别 `NODE1_MIC` 到 `NODE4_MIC`。
+再用 `check_mics.py` 真正逐个打开录音流、测量分贝，确认"设备在"且"有声音"（而不是
+只列出设备）：
+
+```powershell
+cd cloud_brain
+python check_mics.py
+python check_mics.py --seconds 3      # 每路多测几秒更稳
+python check_mics.py --verbose        # 额外打印所有输入设备
+```
+
+输出会区分 ✅ 有声音 / ⚠️ 静音疑似无信号 / ❌ 未识别到。确认 4 路都 `✅` 即可。打包版
+双击 `check_mics.exe` 也能自检，无需装 Python。
 
 ### 4. 配置并烧录机器人
 
@@ -601,6 +665,8 @@ python main_brain.py --no-mic
 python main_brain.py --loose-thresholds
 python main_brain.py --schedule-interval 60
 python main_brain.py --no-mic --schedule-interval 10 --demo-state node1=100,node2=10,node3=0,node4=15
+python main_brain.py --no-whisper --no-vad     # 剥离 torch，仅录音+人声判定+干预
+python main_brain.py --detect-mode legacy      # 回退到旧瞬时判定
 ```
 
 | 参数 | 说明 |
@@ -610,6 +676,12 @@ python main_brain.py --no-mic --schedule-interval 10 --demo-state node1=100,node
 | `--loose-thresholds` | 放宽音频判定阈值，适合现场调试 |
 | `--schedule-interval` | 修改干预检查间隔，单位为秒 |
 | `--demo-state` | 注入测试发言时长；当前应与 `--no-mic` 配合使用 |
+| `--detect-mode {robust,legacy}` | 说话人判定模式，默认 `robust`（自适应底噪+主导说话人+静音容忍）；`legacy` 保留旧瞬时判定 |
+| `--no-whisper` | 不启动语音转写线程，不加载 faster-whisper/torch |
+| `--no-vad` | 不初始化 Silero VAD，不加载 torch；robust 判定本身不依赖 VAD |
+
+> PyInstaller 打包的 exe 默认即"无 whisper + 无 VAD"（`sys.frozen` 时自动为真），因此双击
+> exe 就有录音 + 人声判定 + 机器人干预，无需额外传参。
 
 ## 本地状态接口
 
@@ -658,6 +730,18 @@ POST /api/session/reset
 `POST /api/session/reset` 仅为旧工具兼容保留。录音进行中会返回 `409`；正式实验请始终使用 `/api/experiment/start` 与 `/api/experiment/end`。
 
 ## 测试与联调
+
+### 人声判定（robust）离线测试
+
+不需要真实麦克风、MQTT 或机器人，用合成音频离线验证"捂住麦克风不乱计"等行为：
+
+```powershell
+cd cloud_brain
+python test_activity_engine.py
+```
+
+该测试覆盖：捂住麦（只有短暂尖峰）不计时、串音不抢主导权、说话中短暂停顿不误停、
+主导者切换需持续证据。
 
 ### 分级干预行为测试
 
@@ -729,6 +813,7 @@ python test_hardware_stability.py --expression-only
 
 ### 其他测试
 
+- `test_activity_engine.py`：robust 人声判定（捂住麦/串音/静音容忍/切换确认）。
 - `test_local_mic.py`：本地麦克风和 VAD。
 - `test_multi_mic.py`：4 路麦克风输入与统计。
 - `test_meeting_logic.py`：会议状态和调度链路。
@@ -750,14 +835,15 @@ python test_hardware_stability.py --expression-only
 - 机器人重启不会自动恢复云端的干预计数；表情等级始终由云端 payload 决定。
 - `expr:stable` 会自动恢复专注；直接发送 `expr:reminder` 或 `expr:curious` 不会自动恢复。
 - TFT 复位脚必须接 IO42，数据线 D7 必须接 GPIO18。若修复后仍在电机启停时出现花屏/半屏，需要检查屏幕和电机供电压降、共地、接头松动及电机端抑制干扰；软件会在电机停止后自动复位并重绘，但无法补偿持续的硬件掉电。
-- 首次运行 Faster-Whisper 和 Torch 时可能需要下载模型缓存。
+- 首次运行 Faster-Whisper 和 Torch（仅源码模式且未加 `--no-whisper`）时可能需要下载模型缓存；打包 exe 已剥离这两者，无需下载。
+- 打包的 `EffMeet.exe` 默认不含语音转写（见"打包与分发"）；如需转写，请在装有 Python 与完整依赖的环境下源码运行 `python main_brain.py`。
 - 软件测试可验证 PCM 帧数、WAV 格式、文件哈希和接口状态，但不能代替现场的 4 个真实麦克风同步录音试听。正式采集前必须做一次短时硬件试录并逐个试听 `node1` 到 `node4`。
 - `cloud_brain/core/speaker_id.py` 和 `cloud_brain/logic/commander.py` 当前为预留模块。
 
 ## 推荐启动顺序
 
 1. 烧录并启动 ESP32-S3 机器人，确认它已连接 Wi-Fi 和 MQTT。
-2. 给 4 路麦克风设置 `NODE1_MIC` 到 `NODE4_MIC`，运行 `python list_mics.py` 检查。
+2. 给 4 路麦克风设置 `NODE1_MIC` 到 `NODE4_MIC`，运行 `python check_mics.py` 确认每路都"有声音"。
 3. 正式实验前运行 `python test_hardware_stability.py`，现场完成 4 种表情和连续 5 轮往返验收。
 4. 做一次短时 4 路硬件试录，结束后逐个试听 WAV，确认节点、座位、声道和音量对应正确。
 5. 正式组双击 `开始实验.bat`，确认目标路径和组号，输入 `START`。

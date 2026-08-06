@@ -1,0 +1,10 @@
+# 打包 exe 用：不含 torch / faster-whisper 的精简依赖清单。
+# 用于把 EffMeet 后台打成一个免装 Python 的绿色目录（录音 + 人声判定 + 机器人干预）。
+# 用 PyInstaller + EffMeet.spec 打包；需在常规 Python（python.org / Anaconda）下执行。
+paho-mqtt==1.6.1
+numpy>=1.21.0
+pandas>=1.3.0
+openpyxl>=3.0.9
+PyYAML>=6.0
+sounddevice>=0.5.0
+Flask>=3.0.0
