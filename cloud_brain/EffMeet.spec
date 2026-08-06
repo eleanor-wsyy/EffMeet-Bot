@@ -49,11 +49,41 @@ exe = EXE(
     console=True,
 )
 
+# 麦克风自检工具 EXE：独立 Analysis（sounddevice/numpy 依赖同样被收集）。
+mic_a = Analysis(
+    ["check_mics.py"],
+    pathex=[],
+    binaries=[],
+    datas=[],
+    hiddenimports=["sounddevice", "numpy"],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=["torch", "torchaudio", "faster_whisper", "ctranslate2"],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+    noarchive=False,
+)
+mic_pyz = PYZ(mic_a.pure, mic_a.zipped_data, cipher=block_cipher)
+mic_exe = EXE(
+    mic_pyz,
+    mic_a.scripts,
+    exclude_binaries=True,
+    name="check_mics",
+    console=True,
+    upx=True,
+)
+
 coll = COLLECT(
     exe,
     a.binaries,
     a.zipfiles,
     a.datas,
+    mic_exe,
+    mic_a.binaries,
+    mic_a.zipfiles,
+    mic_a.datas,
     strip=False,
     upx=True,
     upx_exclude=[],
