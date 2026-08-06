@@ -1,3 +1,7 @@
+param(
+    [switch]$NoRobot
+)
+
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -7,6 +11,10 @@ $startUrl = "http://127.0.0.1:5000/api/experiment/start"
 $dashboardUrl = "http://127.0.0.1:5000/"
 
 & $startScript -NoBrowser
+
+if ($NoRobot) {
+    Write-Host "机器人未连接模式：只要求 4 路麦克风即可开始录音。"
+}
 
 $ready = $false
 $health = $null
@@ -19,7 +27,14 @@ for ($attempt = 0; $attempt -lt 120; $attempt++) {
             Start-Process $dashboardUrl
             exit 3
         }
-        if (
+        if ($NoRobot) {
+            # 免机器人模式：只要 4 路麦克风齐即可开始（不管机器人/MQTT 状态）。
+            if ($microphoneCount -eq 4) {
+                $ready = $true
+                break
+            }
+        }
+        elseif (
             $microphoneCount -eq 4 -and
             $health.mqtt_connected -and
             $health.robot_online -and
@@ -71,6 +86,7 @@ if (-not [string]::IsNullOrWhiteSpace($groupText)) {
 $body = @{
     output_dir = $outputDir
     group_number = $groupValue
+    require_robot = -not $NoRobot
 } | ConvertTo-Json
 
 try {
