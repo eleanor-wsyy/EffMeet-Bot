@@ -149,6 +149,7 @@ _audio_streams = []
 _microphones = {}
 _audio_workers_started = False
 _no_mic_mode = False
+_no_robot_mode = False
 _pending_session_snapshot = None
 _experiment_api_lock = threading.Lock()
 
@@ -377,6 +378,45 @@ def health():
     )
 
 
+# 机器人端可显示的表情名（与固件 parseExpressionName / README 一致）。
+_VALID_EXPRESSIONS = {"focus", "stable", "reminder", "curious"}
+
+
+@app.route("/api/expr", methods=["POST"])
+def send_expression_api():
+    """手动下发表情指令给机器人，格式 expr:<name>。
+
+    请求体: {"expression": "focus|stable|reminder|curious"}
+    用于在网页控制台手动切换表情（测试/调试用）。只改变 TFT 显示，不移动机器人，
+    也不改变云端的干预统计。机器人若离线，可正常返回但下发失败会提示。
+    """
+    body = request.get_json(silent=True) or {}
+    name = str(body.get("expression") or "").strip().lower()
+    if name not in _VALID_EXPRESSIONS:
+        return jsonify(
+            {
+                "status": "error",
+                "message": f"无效表情：{name or '(空)'}。可选：focus / stable / reminder / curious",
+            }
+        ), 400
+
+    client = _mqtt_client_ref
+    published = False
+    if client is not None and client.is_connected():
+        client.publish(MQTT_TOPIC_CONTROL, f"expr:{name}")
+        published = True
+
+    result = {
+        "status": "ok" if published else "offline",
+        "expression": name,
+        "published": published,
+        "message": f"已下发 expr:{name}" if published else "MQTT 未连接或机器人不在线，指令未下发（仍可稍后重试）。",
+        "mqtt_connected": bool(_mqtt_connected.is_set()),
+        "robot_online": bool(_robot_online.is_set()),
+    }
+    return jsonify(result), 200 if published else 502
+
+
 @app.route("/api/experiment/start", methods=["POST"])
 @serialize_experiment_api
 def start_experiment_api():
@@ -391,18 +431,23 @@ def start_experiment_api():
                 "message": f"只检测到 {len(_microphones)} 路麦克风，必须先接齐并命名 4 路设备。",
             }
         ), 409
-    if not _mqtt_connected.is_set() or not _robot_online.is_set():
+
+    body = request.get_json(silent=True) or {}
+    # require_robot=false => 机器人未连接也能开始录音（仅测麦克风）；默认为 True（仍要求机器人）。
+    global _no_robot_mode
+    _no_robot_mode = not bool(body.get("require_robot", True))
+
+    if not _no_robot_mode and (not _mqtt_connected.is_set() or not _robot_online.is_set()):
         return jsonify(
             {"status": "error", "message": "云端 MQTT 或机器人尚未在线，拒绝开始实验。"}
         ), 409
 
     with _cycle_lock:
-        if _robot_busy:
+        if not _no_robot_mode and _robot_busy:
             return jsonify(
                 {"status": "busy", "message": "机器人仍在执行任务，暂不能开始新实验。"}
             ), 409
 
-    body = request.get_json(silent=True) or {}
     output_dir = str(body.get("output_dir") or "").strip()
     group_number = body.get("group_number")
     if isinstance(group_number, str):
@@ -1127,12 +1172,12 @@ def mqtt_monitor_worker(schedule_interval):
             print("[调度] 实验未在采集中或正在结束，本轮不结算。")
             continue
 
-        if not _mqtt_connected.is_set() or not _robot_online.is_set():
+        if not _no_robot_mode and (not _mqtt_connected.is_set() or not _robot_online.is_set()):
             print("[调度] MQTT 或机器人尚未在线，本轮不结算，避免生成无法执行的任务。")
             continue
 
         with _cycle_lock:
-            if _robot_busy:
+            if not _no_robot_mode and _robot_busy:
                 print("[调度] 机器人正在执行任务，等待下一轮检查。")
                 continue
 
