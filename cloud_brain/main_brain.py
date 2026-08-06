@@ -417,6 +417,114 @@ def send_expression_api():
     return jsonify(result), 200 if published else 502
 
 
+@app.route("/api/expression/upload", methods=["POST"])
+def upload_expression_api():
+    """上传一张 480x320 1-bit 表情 PNG，自动转成固件 .h 并替换所选槽位。
+
+    请求: multipart/form-data，字段 file=<png> 和 slot=<focus|reminder|curious|stable>。
+    覆盖位置: robot_esp32/1.3/<slot 对应 .h>（focus 额外保留 #define IMG_W/IMG_H）。
+    复用 robot_esp32/1.3/png_to_h.py 的转码逻辑。
+    """
+    import sys
+    import tempfile
+    from pathlib import Path as _P
+
+    # 定位固件目录：源码运行在 BASE_DIR.parent/robot_esp32/1.3；冻结(exe)时先看打包进
+    # _internal/firmware/png_to_h.py（若固件目录不存在则退化为只读回显）。
+    frozen = getattr(sys, "frozen", False)
+    candidates = []
+    if not frozen:
+        candidates.append(_P(BASE_DIR).parent / "robot_esp32" / "1.3")
+    firmware_dir = None
+    for cand in candidates:
+        if (cand / "stable_image.h").is_file():
+            firmware_dir = cand
+            break
+
+    upload = request.files.get("file")
+    slot = str(request.form.get("slot") or "").strip().lower()
+    if upload is None or not upload.filename:
+        return jsonify({"status": "error", "message": "未收到图片文件。"}), 400
+
+    # 复用 png_to_h 的转码逻辑（含 SLOTS、png_to_bytes、bytes_to_h、尺寸校验）。
+    tool_dirs = []
+    if firmware_dir is not None:
+        tool_dirs.append(str(firmware_dir))
+    bundled = _P(getattr(sys, "_MEIPASS", _P(BASE_DIR))) / "firmware"
+    if (bundled / "png_to_h.py").is_file():
+        tool_dirs.append(str(bundled))
+    for tool_dir in tool_dirs:
+        if tool_dir not in sys.path:
+            sys.path.insert(0, tool_dir)
+    try:
+        import png_to_h
+    except SystemExit:
+        # png_to_h.py 缺 Pillow 时会直接 SystemExit，需转成可读错误而非断连。
+        return jsonify(
+            {"status": "error", "message": "缺少 Pillow 库，无法转码。请先安装：python -m pip install pillow"}
+        ), 500
+    except Exception as exc:
+        return jsonify({"status": "error", "message": f"加载转码模块失败：{exc}"}), 500
+
+    if slot not in png_to_h.SLOTS:
+        return jsonify(
+            {
+                "status": "error",
+                "message": f"无效槽位：{slot}。可选：{' / '.join(sorted(png_to_h.SLOTS))}",
+            }
+        ), 400
+
+    filename, array_name = png_to_h.SLOTS[slot]
+
+    # 固件目录存在则写进对应槽位；否则落到本机 cloud_brain/data/expressions/ 供手动拷贝。
+    if firmware_dir is not None:
+        out_dir = firmware_dir
+    else:
+        out_dir = _P(BASE_DIR) / "data" / "expressions"
+        out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / filename
+
+    # 存临时 png 再交给 png_to_bytes（它从磁盘读取并校验 480x320）。
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp.write(upload.read())
+            tmp_path = _P(tmp.name)
+        data = png_to_h.png_to_bytes(str(tmp_path))
+        content = png_to_h.bytes_to_h(data, array_name, upload.filename or f"{slot}.png", slot)
+        tmp_path.unlink(missing_ok=True)
+    except ValueError as exc:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except (NameError, UnboundLocalError):
+            pass
+        return jsonify({"status": "error", "message": str(exc)}), 400
+    except Exception as exc:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except (NameError, UnboundLocalError):
+            pass
+        return jsonify({"status": "error", "message": f"转码失败：{exc}"}), 500
+
+    try:
+        out_path.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        return jsonify(
+            {"status": "error", "message": f"写入 {out_path.name} 失败：{exc}"}
+        ), 500
+
+    print(f"[表情] 已上传并转码 {slot} -> {out_path.name}（{len(data)} 字节）")
+    return jsonify(
+        {
+            "status": "ok",
+            "slot": slot,
+            "file": out_path.name,
+            "array_name": array_name,
+            "bytes": len(data),
+            "message": f"已生成 {out_path.name}（数组 {array_name}，{len(data)} 字节）。编译固件后生效。",
+        }
+    )
+
+
 @app.route("/api/experiment/start", methods=["POST"])
 @serialize_experiment_api
 def start_experiment_api():
@@ -787,6 +895,11 @@ def clear_audio_analysis_queues():
 
 
 def queue_transcription(session_generation, node_name, frames, max_db):
+    # whisper 关闭时没有 whisper_worker 消费 transcribe_queue；若仍入队，
+    # unfinished_tasks 永不归零，结束实验时 flush_audio_processing 会误判为
+    # "语音转写未在限定时间内完成" 而失败。此处直接返回，不产生任何待转写任务。
+    if not USE_WHISPER:
+        return
     transcribe_queue.put(
         (session_generation, node_name, list(frames), float(max_db))
     )

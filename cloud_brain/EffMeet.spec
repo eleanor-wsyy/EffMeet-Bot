@@ -11,12 +11,15 @@ a = Analysis(
     binaries=[],
     datas=[
         ("templates", "templates"),          # Flask 网页控制台
+        (os.path.join("..", "robot_esp32", "1.3", "png_to_h.py"), "firmware"),
     ],
     hiddenimports=[
         "sounddevice",
         "experiment_recording",
         "core.activity_engine",
         "core.vad_engine",
+        "PIL",
+        "PIL.Image",
     ],
     hookspath=[],
     hooksconfig={},

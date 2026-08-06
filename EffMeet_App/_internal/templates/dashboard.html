@@ -122,8 +122,48 @@
       </div>
       <p class="hint">正式目录命名：<code>YYYYMMDD_HHMMSS_groupNNN</code>。其中包含 node1–node4 四个 WAV、会话 JSON 和带 SHA-256 的 manifest。目标路径可直接填写移动硬盘或网络盘的绝对路径。</p>
       <div class="actions">
+        <label class="no-robot-label" title="勾选后即使机器人未连接也能开始录音，适合先测麦克风">
+          <input id="no-robot" type="checkbox">
+          机器人未连接（仅测麦克风/录音）
+        </label>
         <button class="start" id="start" type="button">明确开始实验并录音</button>
       </div>
+    </section>
+
+    <section class="panel" id="expr-panel">
+      <h3>手动表情</h3>
+      <p class="hint">将 `expr:<名称>` 直接下发给机器人（仅改变 TFT 显示，不移动小车，不影响干预计数）。</p>
+      <div class="actions">
+        <button class="start" data-expr="focus" type="button">专注 focus</button>
+        <button class="start" data-expr="reminder" type="button">提醒 reminder</button>
+        <button class="start" data-expr="curious" type="button">好奇 curious</button>
+        <button class="start" data-expr="stable" type="button">稳定 stable</button>
+      </div>
+      <p id="expr-result" class="hint"></p>
+    </section>
+
+    <section class="panel">
+      <h3>上传表情图片</h3>
+      <p class="hint">上传一张 480x320 的黑白(1-bit) PNG，自动转成机器人固件的 .h 位图，覆盖所选槽位（原 4 个表情保留，测试时可选其它槽位）。上传后需重新编译烧录固件才生效。</p>
+      <div class="form-grid">
+        <label>
+          表情图片（PNG, 480x320）
+          <input id="expr-file" type="file" accept="image/png">
+        </label>
+        <label>
+          覆盖槽位
+          <select id="expr-slot">
+            <option value="focus">focus（专注, image_array.h）</option>
+            <option value="reminder">reminder（提醒, reminder_image.h）</option>
+            <option value="curious">curious（好奇, curious_image.h）</option>
+            <option value="stable">stable（稳定, stable_image.h）</option>
+          </select>
+        </label>
+      </div>
+      <div class="actions">
+        <button class="start" id="expr-upload" type="button">上传并转码</button>
+      </div>
+      <p id="expr-upload-result" class="hint"></p>
     </section>
 
     <section class="panel" id="end-panel" hidden>
@@ -173,6 +213,13 @@
       retry: document.querySelector('#retry'),
       message: document.querySelector('#message'),
       destination: document.querySelector('#destination'),
+      noRobot: document.querySelector('#no-robot'),
+      exprResult: document.querySelector('#expr-result'),
+      exprButtons: document.querySelectorAll('[data-expr]'),
+      exprFile: document.querySelector('#expr-file'),
+      exprSlot: document.querySelector('#expr-slot'),
+      exprUpload: document.querySelector('#expr-upload'),
+      exprUploadResult: document.querySelector('#expr-upload-result'),
     };
     let latest = null;
     let shutdownExpected = false;
@@ -227,9 +274,12 @@
       elements.errorPanel.hidden = !fatalError;
       elements.stagingDirectory.textContent = `本机暂存目录：${recording.staging_dir || '未取得路径，请查看后台日志'}`;
 
-      const ready = microphonesReady && data.mqtt_connected && data.robot_online && !data.robot_busy && state === 'ready';
+      const noRobot = elements.noRobot.checked;
+      const baseReady = microphonesReady && state === 'ready';
+      const fullReady = baseReady && data.mqtt_connected && data.robot_online && !data.robot_busy;
+      const ready = noRobot ? baseReady : fullReady;
       elements.start.disabled = !ready;
-      elements.start.title = ready ? '' : '必须满足：4 路麦克风、MQTT、机器人全部就绪且机器人空闲';
+      elements.start.title = ready ? '' : (noRobot ? '需 4 路麦克风就绪' : '必须满足：4 路麦克风、MQTT、机器人全部就绪且机器人空闲');
 
       elements.phasePanel.className = `panel phase ${recordingNow ? 'recording' : (finished ? 'done' : (fatalError ? 'error' : 'ready'))}`;
       if (recordingNow) {
@@ -294,6 +344,7 @@
         const result = await post('/api/experiment/start', {
           output_dir: path,
           group_number: groupText || null,
+          require_robot: !elements.noRobot.checked,
         });
         elements.message.textContent = `开始成功：${result.recording.experiment_id}`;
         elements.message.className = 'ok';
@@ -346,6 +397,56 @@
         elements.message.className = 'bad';
       } finally {
         elements.retry.disabled = false;
+      }
+    });
+
+    elements.exprButtons.forEach((button) => {
+      button.addEventListener('click', async () => {
+        const expression = button.dataset.expr;
+        button.disabled = true;
+        elements.exprResult.textContent = `正在下发 ${expression} …`;
+        elements.exprResult.className = 'warn';
+        try {
+          const result = await post('/api/expr', { expression });
+          elements.exprResult.textContent = result.message;
+          elements.exprResult.className = result.published ? 'ok' : 'bad';
+        } catch (error) {
+          elements.exprResult.textContent = `下发失败：${error.message}`;
+          elements.exprResult.className = 'bad';
+        } finally {
+          button.disabled = false;
+        }
+      });
+    });
+
+    elements.exprUpload.addEventListener('click', async () => {
+      const file = elements.exprFile.files[0];
+      if (!file) {
+        elements.exprUploadResult.textContent = '请先选择一张 PNG 图片。';
+        elements.exprUploadResult.className = 'bad';
+        return;
+      }
+      const slot = elements.exprSlot.value;
+      elements.exprUpload.disabled = true;
+      elements.exprUploadResult.textContent = `正在上传并转码到 ${slot} …`;
+      elements.exprUploadResult.className = 'warn';
+      try {
+        const form = new FormData();
+        form.append('file', file);
+        form.append('slot', slot);
+        const response = await fetch('/api/expression/upload', {
+          method: 'POST',
+          body: form,
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.message || `HTTP ${response.status}`);
+        elements.exprUploadResult.textContent = result.message;
+        elements.exprUploadResult.className = 'ok';
+      } catch (error) {
+        elements.exprUploadResult.textContent = `上传失败：${error.message}`;
+        elements.exprUploadResult.className = 'bad';
+      } finally {
+        elements.exprUpload.disabled = false;
       }
     });
 
