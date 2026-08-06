@@ -508,7 +508,7 @@ python check_mics.py --verbose        # 额外打印所有输入设备
 
 打开 `robot_esp32/1.3/1.3.ino`，确认：
 
-- `WIFI_SSID` 和 `WIFI_PASSWORD` 正确。
+- WiFi 不再写死在代码中；首次烧录后通过配网热点填写 SSID 和密码。
 - MQTT Broker 和主题与云端一致。
 - 开发板选择 ESP32-S3。
 - Arduino 库版本与上方验证版本一致。
@@ -516,6 +516,17 @@ python check_mics.py --verbose        # 额外打印所有输入设备
 - TFT 数据线 `D7` 接在 **GPIO18**。旧版本使用的 GPIO19 已废弃。
 
 烧录后通过串口确认 Wi-Fi、MQTT 和 TFT 初始化成功。
+
+#### WiFi 配网（只需烧录一次）
+
+固件会把 WiFi 凭据保存到 ESP32 的 NVS 闪存中。以后更换 WiFi 或密码时不需要重新烧录：
+
+1. 首次启动，或设备连接已保存的 WiFi 失败后，打开手机/电脑的 WiFi 列表。
+2. 连接设备发出的热点 `EffMeet-Setup-XXXX`，热点密码为 `EffMeet123`。
+3. 浏览器打开 <http://192.168.4.1/>，填写现场 WiFi 名称和密码，点击“保存并重启”。
+4. 设备重启后会自动连接新 WiFi，并在串口输出新的设备 IP。
+
+设备已经连上旧 WiFi 时，也可以直接访问串口输出的 `http://设备IP/` 修改 WiFi；页面的“清除已保存 WiFi”按钮会清除凭据并重启进入配网模式。保存的密码只写入设备本地，不会提交到 GitHub。
 
 ### 5. 明确开始实验（推荐）
 
