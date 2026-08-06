@@ -412,34 +412,35 @@ TFT 使用整屏地址窗口连续写入 480×320 像素，不再逐像素重复
 
 ### 打包与分发
 
-项目可用 PyInstaller 打成一个免装 Python 的绿色目录（缺省剥离 torch / faster-whisper，
-专注录音 + 人声判定 + 机器人干预）。产物在 `cloud_brain/dist/EffMeet/`：
+**现成可运行版本就在仓库根目录 `EffMeet_App/`**，免装 Python，拷贝即用：
 
-- `EffMeet.exe` —— 后台主程序（等价 `python main_brain.py --no-whisper --no-vad`）
-- `check_mics.exe` —— 麦克风自检工具
-- 把整个目录拷贝到任意一台 Windows 电脑，双击 `EffMeet.exe` 即启动，浏览器开
-  <http://127.0.0.1:5000/> 使用。
+- 双击 `EffMeet_App/EffMeet.exe` 即启动后台（等价 `python main_brain.py --no-whisper --no-vad`），
+  浏览器开 <http://127.0.0.1:5000/> 使用。
+- `EffMeet_App/check_mics.exe` 是麦克风自检工具，双击即可确认 4 路 NODE*_MIC 是否连上、有声音。
+- 把整个 `EffMeet_App/` 目录拷贝到任意一台 Windows 电脑即可运行。
 
-本地重新打包：
+也可从 GitHub Release 下载打包好的 zip：
+
+```text
+https://github.com/eleanor-wsyy/EffMeet-Bot/releases
+```
+
+> 说明：exe 缺省剥离 Whisper 转写与 torch，但保留录音 + 人声判定 + 机器人干预
+> （robust 判定不依赖 torch）。若需语音转写，请在本机装有 Python 与完整依赖的环境下
+> 源码运行 `python main_brain.py`。
+
+本地重新打包（生成新的 `EffMeet_App/`）：
 
 ```powershell
 cd cloud_brain
-python -m pip install pyinstaller -r requirements_pack.txt   # 见下
+python -m pip install pyinstaller -r requirements_pack.txt   # 不含 torch/whisper
 python -m PyInstaller EffMeet.spec --noconfirm --clean
+# 把生成物复制到仓库根：copy cl_brain..\dist 见下注释
 ```
 
 打包环境要求常规 Python（微软商店版 Python 无法被 PyInstaller 打包，请用 python.org 或
 Anaconda 安装版）。`requirements_pack.txt` 提供不含 torch/whisper 的依赖清单：
 `paho-mqtt numpy pandas openpyxl PyYAML sounddevice Flask`。
-
-> 语义：exe 默认剥离 Whisper 转写，但保留录音 + 人声判定 + 机器人干预（robust 判定
-> 不依赖 torch）。若需转写，源码运行上述完整功能，或用 `--no-whisper` 显式关闭。
-
-已发布的可运行版本可从 GitHub Release 下载：
-
-```text
-https://github.com/eleanor-wsyy/EffMeet-Bot/releases
-```
 
 ### 机器人端
 

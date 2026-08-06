@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EffMeet 实验控制台</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+      background: #f3f5f7;
+      color: #172033;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { width: min(1040px, calc(100% - 32px)); margin: 28px auto; }
+    h1 { margin: 0 0 6px; font-size: 28px; }
+    .subtitle { margin: 0 0 20px; color: #637083; }
+    .panel {
+      background: #fff;
+      border: 1px solid #e0e5eb;
+      border-radius: 14px;
+      padding: 20px;
+      margin-bottom: 16px;
+      box-shadow: 0 6px 24px rgba(20, 32, 51, .06);
+    }
+    .phase {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      border-left: 6px solid #8b95a5;
+    }
+    .phase.ready { border-left-color: #1769e0; }
+    .phase.recording { border-left-color: #d92d20; }
+    .phase.done { border-left-color: #16794b; }
+    .phase.error { border-left-color: #b42318; }
+    .phase h2 { margin: 0 0 5px; font-size: 21px; }
+    .phase p { margin: 0; color: #637083; }
+    .clock { font: 700 30px/1 ui-monospace, Consolas, monospace; }
+    .status-grid, .nodes { display: grid; gap: 12px; }
+    .status-grid { grid-template-columns: repeat(4, 1fr); }
+    .nodes { grid-template-columns: repeat(4, 1fr); margin-top: 14px; }
+    .metric { padding: 13px; border-radius: 10px; background: #f7f8fa; }
+    .metric span { display: block; color: #748094; font-size: 13px; margin-bottom: 6px; }
+    .metric strong { display: block; font-size: 18px; overflow-wrap: anywhere; }
+    .node strong { font-size: 24px; }
+    .ok { color: #16794b; }
+    .warn { color: #b25700; }
+    .bad { color: #b42318; }
+    .form-grid { display: grid; grid-template-columns: 1fr 180px; gap: 14px; }
+    label { display: block; color: #4f5c6e; font-size: 14px; font-weight: 700; }
+    input {
+      width: 100%;
+      margin-top: 7px;
+      padding: 12px;
+      border: 1px solid #cfd6df;
+      border-radius: 9px;
+      font: inherit;
+    }
+    .hint { margin: 12px 0 0; color: #637083; font-size: 13px; line-height: 1.55; }
+    .actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 18px; }
+    button {
+      min-width: 220px;
+      border: 0;
+      border-radius: 10px;
+      padding: 14px 20px;
+      color: #fff;
+      font-size: 16px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    button:disabled { background: #aab2bf !important; cursor: not-allowed; }
+    .start { background: #1769e0; }
+    .start:hover { background: #0d58c7; }
+    .end { background: #d92d20; }
+    .end:hover { background: #b42318; }
+    .retry { background: #b25700; }
+    #message { min-height: 26px; margin: 12px 2px; font-weight: 700; overflow-wrap: anywhere; }
+    .destination { margin-top: 12px; padding: 12px; background: #edf8f2; border-radius: 9px; overflow-wrap: anywhere; }
+    [hidden] { display: none !important; }
+    @media (max-width: 780px) {
+      .status-grid, .nodes, .form-grid { grid-template-columns: repeat(2, 1fr); }
+      .phase { align-items: flex-start; flex-direction: column; }
+      button { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>EffMeet 实验控制台</h1>
+    <p class="subtitle">一次后台进程只负责一组实验：明确开始录音，明确结束并校验传送，然后后台自动关闭。</p>
+
+    <section class="panel phase ready" id="phase-panel">
+      <div>
+        <h2 id="phase-title">尚未开始 · 当前不录音</h2>
+        <p id="phase-detail">检查设备状态和保存路径，然后点击“明确开始实验”。</p>
+      </div>
+      <div class="clock" id="elapsed">00:00:00</div>
+    </section>
+
+    <section class="panel">
+      <div class="status-grid">
+        <div class="metric"><span>4 路麦克风</span><strong id="mics">检查中</strong></div>
+        <div class="metric"><span>云端 MQTT</span><strong id="mqtt">连接中</strong></div>
+        <div class="metric"><span>机器人</span><strong id="robot">读取中</strong></div>
+        <div class="metric"><span>实验编号</span><strong id="experiment-id">尚未生成</strong></div>
+      </div>
+      <div class="nodes" id="nodes"></div>
+    </section>
+
+    <section class="panel" id="start-panel">
+      <div class="form-grid">
+        <label>
+          录音传送目标路径
+          <input id="output-dir" type="text" autocomplete="off" spellcheck="false">
+        </label>
+        <label>
+          当天组号
+          <input id="group-number" type="number" min="1" max="9999" placeholder="留空自动递增">
+        </label>
+      </div>
+      <p class="hint">正式目录命名：<code>YYYYMMDD_HHMMSS_groupNNN</code>。其中包含 node1–node4 四个 WAV、会话 JSON 和带 SHA-256 的 manifest。目标路径可直接填写移动硬盘或网络盘的绝对路径。</p>
+      <div class="actions">
+        <button class="start" id="start" type="button">明确开始实验并录音</button>
+      </div>
+    </section>
+
+    <section class="panel" id="end-panel" hidden>
+      <p>点击结束后，系统立即停止四路采集，完整封口 WAV，等待最后转写，传送并逐文件校验。全部成功后后台自动退出。</p>
+      <div class="actions">
+        <button class="end" id="end" type="button">明确结束实验</button>
+      </div>
+    </section>
+
+    <section class="panel" id="retry-panel" hidden>
+      <p class="bad">录音已停止，但上次传送或校验失败。本机暂存文件没有删除。修复目标路径后重试。</p>
+      <div class="actions">
+        <button class="retry" id="retry" type="button">重试传送并校验</button>
+      </div>
+    </section>
+
+    <section class="panel" id="error-panel" hidden>
+      <p class="bad"><strong>录音完整性检查失败，不能自动标记为完整实验。</strong></p>
+      <p>后台不会自动退出，暂存文件也不会删除。请记录下方暂存目录，保留现场日志并人工检查；处理前不要重新开始本组。</p>
+      <div class="destination" id="staging-directory"></div>
+    </section>
+
+    <div id="message" role="status" aria-live="polite"></div>
+    <div class="destination" id="destination" hidden></div>
+  </main>
+
+  <script>
+    const elements = {
+      phasePanel: document.querySelector('#phase-panel'),
+      phaseTitle: document.querySelector('#phase-title'),
+      phaseDetail: document.querySelector('#phase-detail'),
+      elapsed: document.querySelector('#elapsed'),
+      mics: document.querySelector('#mics'),
+      mqtt: document.querySelector('#mqtt'),
+      robot: document.querySelector('#robot'),
+      experimentId: document.querySelector('#experiment-id'),
+      nodes: document.querySelector('#nodes'),
+      outputDir: document.querySelector('#output-dir'),
+      groupNumber: document.querySelector('#group-number'),
+      startPanel: document.querySelector('#start-panel'),
+      endPanel: document.querySelector('#end-panel'),
+      retryPanel: document.querySelector('#retry-panel'),
+      errorPanel: document.querySelector('#error-panel'),
+      stagingDirectory: document.querySelector('#staging-directory'),
+      start: document.querySelector('#start'),
+      end: document.querySelector('#end'),
+      retry: document.querySelector('#retry'),
+      message: document.querySelector('#message'),
+      destination: document.querySelector('#destination'),
+    };
+    let latest = null;
+    let shutdownExpected = false;
+    let outputInitialized = false;
+
+    function duration(seconds) {
+      const value = Math.max(0, Math.floor(Number(seconds || 0)));
+      const h = String(Math.floor(value / 3600)).padStart(2, '0');
+      const m = String(Math.floor((value % 3600) / 60)).padStart(2, '0');
+      const s = String(value % 60).padStart(2, '0');
+      return `${h}:${m}:${s}`;
+    }
+
+    function setStatus(element, text, className) {
+      element.textContent = text;
+      element.className = className;
+    }
+
+    function render(data) {
+      latest = data;
+      const recording = data.experiment || {};
+      const state = recording.state || 'ready';
+      const microphonesReady = (data.microphones || []).length === 4;
+
+      if (!outputInitialized) {
+        elements.outputDir.value = data.default_output_dir || '';
+        outputInitialized = true;
+      }
+
+      setStatus(elements.mics, microphonesReady ? '4/4 已就绪' : `${(data.microphones || []).length}/4 未就绪`, microphonesReady ? 'ok' : 'bad');
+      setStatus(elements.mqtt, data.mqtt_connected ? '已连接' : '未连接', data.mqtt_connected ? 'ok' : 'bad');
+      setStatus(elements.robot, !data.robot_online ? '设备离线' : (data.robot_busy ? '执行任务中' : '在线 · 空闲'), !data.robot_online ? 'bad' : (data.robot_busy ? 'warn' : 'ok'));
+      elements.experimentId.textContent = recording.experiment_id || '尚未生成';
+      elements.elapsed.textContent = duration(recording.elapsed_seconds);
+
+      const times = data.current_speaking_times || {};
+      const counts = data.intervention_counts || {};
+      const frames = recording.frames || {};
+      elements.nodes.innerHTML = [1, 2, 3, 4].map(number => {
+        const key = `node${number}`;
+        const recorded = Number(frames[key] || 0) / 16000;
+        return `<div class="metric node"><span>${key} · 发言 ${Number(times[key] || 0).toFixed(1)}s · 干预 ${Number(counts[key] || 0)} 次</span><strong>录音 ${recorded.toFixed(1)}s</strong></div>`;
+      }).join('');
+
+      const recordingNow = state === 'recording';
+      const retrying = state === 'export_failed';
+      const finished = state === 'exported';
+      const fatalError = state === 'error';
+      elements.startPanel.hidden = recordingNow || retrying || finished || fatalError || ['finalizing', 'exporting', 'stopped'].includes(state);
+      elements.endPanel.hidden = !recordingNow;
+      elements.retryPanel.hidden = !retrying;
+      elements.errorPanel.hidden = !fatalError;
+      elements.stagingDirectory.textContent = `本机暂存目录：${recording.staging_dir || '未取得路径，请查看后台日志'}`;
+
+      const ready = microphonesReady && data.mqtt_connected && data.robot_online && !data.robot_busy && state === 'ready';
+      elements.start.disabled = !ready;
+      elements.start.title = ready ? '' : '必须满足：4 路麦克风、MQTT、机器人全部就绪且机器人空闲';
+
+      elements.phasePanel.className = `panel phase ${recordingNow ? 'recording' : (finished ? 'done' : (fatalError ? 'error' : 'ready'))}`;
+      if (recordingNow) {
+        elements.phaseTitle.textContent = '实验进行中 · 正在录音';
+        elements.phaseDetail.textContent = `开始时间：${recording.started_at || '—'}；结束前请勿关闭页面或后台。`;
+      } else if (finished) {
+        elements.phaseTitle.textContent = '实验已明确结束 · 文件已校验';
+        elements.phaseDetail.textContent = '后台正在自动关闭，可以关闭本页面。';
+      } else if (retrying) {
+        elements.phaseTitle.textContent = '实验已停止 · 等待重新传送';
+        elements.phaseDetail.textContent = recording.error || '目标路径不可用。';
+      } else if (fatalError) {
+        elements.phaseTitle.textContent = '实验已停止 · 录音完整性异常';
+        elements.phaseDetail.textContent = recording.error || 'WAV 写入或封口未通过完整性检查。';
+      } else if (['finalizing', 'exporting', 'stopped'].includes(state)) {
+        elements.phaseTitle.textContent = '实验正在明确结束 · 请勿关闭';
+        elements.phaseDetail.textContent = '正在封口、等待转写或校验传送。';
+      } else {
+        elements.phaseTitle.textContent = '尚未开始 · 当前不录音';
+        elements.phaseDetail.textContent = '检查设备状态和保存路径，然后点击“明确开始实验”。';
+      }
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch('/api/get_meeting_data', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        render(await response.json());
+      } catch (error) {
+        if (shutdownExpected) return;
+        elements.message.textContent = `后台连接失败：${error.message}`;
+        elements.message.className = 'bad';
+      }
+    }
+
+    async function post(url, body) {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body || {}),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.message || `HTTP ${response.status}`);
+      return result;
+    }
+
+    elements.start.addEventListener('click', async () => {
+      const path = elements.outputDir.value.trim();
+      if (!path) {
+        elements.message.textContent = '必须填写录音传送目标路径。';
+        elements.message.className = 'bad';
+        return;
+      }
+      const confirmed = window.confirm(`确认明确开始本组实验吗？\n\n录音目标：${path}\n开始后将立即启动四路录音。`);
+      if (!confirmed) return;
+
+      elements.start.disabled = true;
+      elements.message.textContent = '正在打开四路麦克风并开始录音…';
+      elements.message.className = 'warn';
+      try {
+        const groupText = elements.groupNumber.value.trim();
+        const result = await post('/api/experiment/start', {
+          output_dir: path,
+          group_number: groupText || null,
+        });
+        elements.message.textContent = `开始成功：${result.recording.experiment_id}`;
+        elements.message.className = 'ok';
+        await refresh();
+      } catch (error) {
+        elements.message.textContent = error.message;
+        elements.message.className = 'bad';
+        await refresh();
+      }
+    });
+
+    elements.end.addEventListener('click', async () => {
+      const confirmed = window.confirm('确认明确结束实验吗？\n\n确认后会立即停止录音，完成封口、传送和校验，并自动关闭后台。');
+      if (!confirmed) return;
+
+      elements.end.disabled = true;
+      elements.message.textContent = '正在停止录音、封口、传送并逐文件校验，请不要关闭页面…';
+      elements.message.className = 'warn';
+      try {
+        const result = await post('/api/experiment/end');
+        shutdownExpected = true;
+        elements.message.textContent = result.message;
+        elements.message.className = 'ok';
+        elements.destination.hidden = false;
+        elements.destination.textContent = `最终目录：${result.export.destination_dir}`;
+        await refresh();
+      } catch (error) {
+        elements.message.textContent = error.message;
+        elements.message.className = 'bad';
+        await refresh();
+      } finally {
+        elements.end.disabled = false;
+      }
+    });
+
+    elements.retry.addEventListener('click', async () => {
+      elements.retry.disabled = true;
+      elements.message.textContent = '正在重新传送并校验…';
+      elements.message.className = 'warn';
+      try {
+        const result = await post('/api/experiment/retry-export');
+        shutdownExpected = true;
+        elements.message.textContent = result.message;
+        elements.message.className = 'ok';
+        elements.destination.hidden = false;
+        elements.destination.textContent = `最终目录：${result.export.destination_dir}`;
+        await refresh();
+      } catch (error) {
+        elements.message.textContent = error.message;
+        elements.message.className = 'bad';
+      } finally {
+        elements.retry.disabled = false;
+      }
+    });
+
+    refresh();
+    setInterval(refresh, 1000);
+  </script>
+</body>
+</html>
