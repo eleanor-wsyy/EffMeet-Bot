@@ -1,6 +1,8 @@
 # Python 编译缓存
 __pycache__/
 *.py[cod]
+# PyInstaller onedir 应用必须包含这些原生 Python 扩展（如 _socket.pyd）。
+!EffMeet_App/_internal/**/*.pyd
 
 # 虚拟环境
 venv/
