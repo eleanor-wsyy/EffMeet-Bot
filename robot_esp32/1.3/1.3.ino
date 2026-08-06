@@ -5,6 +5,8 @@
 // ============================================================
 
 #include <WiFi.h>
+#include <Preferences.h>
+#include <WebServer.h>
 #include <PubSubClient.h>
 #include <Arduino_GFX_Library.h>
 
@@ -23,10 +25,13 @@
 #define WIFI_RECONNECT_MS        5000
 
 // ============================================================
-// WiFi
+// WiFi 配网
 // ============================================================
-#define WIFI_SSID       "xinle"
-#define WIFI_PASSWORD   "ljqljqljq"
+// WiFi 凭据保存在 ESP32 NVS 中，不再写死在固件里。
+// 首次启动或连接失败时，设备会开启 EffMeet-Setup-XXXX 配网热点。
+#define WIFI_CONFIG_AP_PASSWORD  "EffMeet123"
+#define WIFI_CONNECT_TIMEOUT_MS  30000UL
+#define WIFI_CONFIG_PORT         80
 
 // ============================================================
 // MQTT
@@ -89,6 +94,11 @@ Arduino_ILI9488 gfx(&tftBus, TFT_RST, 1, false);   // rotation=1（横屏）
 // ============================================================
 WiFiClient   espClient;
 PubSubClient mqtt(espClient);
+Preferences  wifiPreferences;
+WebServer    wifiConfigServer(WIFI_CONFIG_PORT);
+
+bool         wifiConfigMode          = false;
+bool         wifiConfigServerStarted = false;
 
 enum ExpressionId : int8_t {
   EXPRESSION_NONE = -1,
@@ -112,6 +122,118 @@ char          pendingStatus[128]       = {0};
 bool mqttConnect();
 void serviceNetwork();
 void publishStatus(const char* message);
+bool connectStoredWiFi(const String& ssid, const String& password);
+void startWiFiConfigServer();
+void startWiFiProvisioning();
+void serviceWiFiConfig();
+
+const char WIFI_CONFIG_PAGE[] PROGMEM = R"HTML(
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EffMeet WiFi 配置</title>
+<style>body{font-family:Arial,sans-serif;max-width:520px;margin:40px auto;padding:0 20px;line-height:1.6}input{box-sizing:border-box;width:100%;padding:10px;margin:5px 0 15px}button{padding:10px 18px;margin-right:8px;cursor:pointer}</style>
+</head><body>
+<h2>EffMeet WiFi 配置</h2>
+<p>输入当前场地的 WiFi 名称和密码，保存后设备会自动重启并连接。</p>
+<form method="post" action="/save">
+<label>WiFi 名称（SSID）</label><input name="ssid" maxlength="32" required>
+<label>WiFi 密码（开放网络可留空）</label><input name="password" type="password" maxlength="63">
+<button type="submit">保存并重启</button>
+</form>
+<form method="post" action="/reset"><button type="submit">清除已保存 WiFi</button></form>
+<p>更换到另一网络时，无需重新烧录；连接设备配网热点后再次填写即可。</p>
+</body></html>
+)HTML";
+
+void handleWiFiConfigPage() {
+  wifiConfigServer.send_P(200, "text/html; charset=utf-8", WIFI_CONFIG_PAGE);
+}
+
+void handleWiFiSave() {
+  String ssid = wifiConfigServer.arg("ssid");
+  String password = wifiConfigServer.arg("password");
+  ssid.trim();
+
+  if (ssid.length() == 0 || ssid.length() > 32 || password.length() > 63) {
+    wifiConfigServer.send(400, "text/plain; charset=utf-8", "SSID 或密码长度无效，请返回重试。");
+    return;
+  }
+
+  wifiPreferences.begin("wifi", false);
+  wifiPreferences.putString("ssid", ssid);
+  wifiPreferences.putString("password", password);
+  wifiPreferences.end();
+
+  wifiConfigServer.send(200, "text/html; charset=utf-8",
+    "<meta charset='utf-8'><h3>已保存，设备正在重启并连接新 WiFi...</h3>");
+  delay(1200);
+  ESP.restart();
+}
+
+void handleWiFiReset() {
+  wifiPreferences.begin("wifi", false);
+  wifiPreferences.clear();
+  wifiPreferences.end();
+  wifiConfigServer.send(200, "text/html; charset=utf-8",
+    "<meta charset='utf-8'><h3>WiFi 已清除，设备正在重启进入配网模式...</h3>");
+  delay(1200);
+  ESP.restart();
+}
+
+void startWiFiConfigServer() {
+  if (wifiConfigServerStarted) return;
+  wifiConfigServer.on("/", HTTP_GET, handleWiFiConfigPage);
+  wifiConfigServer.on("/save", HTTP_POST, handleWiFiSave);
+  wifiConfigServer.on("/reset", HTTP_POST, handleWiFiReset);
+  wifiConfigServer.begin();
+  wifiConfigServerStarted = true;
+}
+
+bool connectStoredWiFi(const String& ssid, const String& password) {
+  if (ssid.length() == 0) return false;
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(ssid.c_str(), password.c_str());
+  Serial.printf("连接 WiFi：%s\n", ssid.c_str());
+
+  unsigned long startedAt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(250);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nWiFi 连接失败，将进入配网模式");
+    return false;
+  }
+
+  Serial.printf("\nWiFi OK, IP: %s\n", WiFi.localIP().toString().c_str());
+  startWiFiConfigServer();
+  Serial.printf("WiFi 配置页：http://%s/\n", WiFi.localIP().toString().c_str());
+  return true;
+}
+
+void startWiFiProvisioning() {
+  uint64_t chipId = ESP.getEfuseMac();
+  char apName[32];
+  snprintf(apName, sizeof(apName), "EffMeet-Setup-%04X", (uint16_t)(chipId & 0xFFFF));
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(apName, WIFI_CONFIG_AP_PASSWORD);
+  startWiFiConfigServer();
+  wifiConfigMode = true;
+
+  Serial.println("\n===== WiFi 配网模式 =====");
+  Serial.printf("连接热点：%s\n", apName);
+  Serial.printf("热点密码：%s\n", WIFI_CONFIG_AP_PASSWORD);
+  Serial.printf("打开网页：http://%s/\n", WiFi.softAPIP().toString().c_str());
+}
+
+void serviceWiFiConfig() {
+  if (wifiConfigServerStarted) wifiConfigServer.handleClient();
+}
 
 void cooperativeDelay(unsigned long durationMs) {
   unsigned long startedAt = millis();
@@ -677,6 +799,9 @@ bool mqttConnect() {
 void serviceNetwork() {
   unsigned long now = millis();
 
+  serviceWiFiConfig();
+  if (wifiConfigMode) return;
+
   if (WiFi.status() != WL_CONNECTED) {
     // 行驶时不做可能阻塞的重连，保证电机控制循环不中断。
     if (!busy && now - lastWifiReconnectAt >= WIFI_RECONNECT_MS) {
@@ -732,23 +857,16 @@ void setup() {
   showExpression(EXPRESSION_FOCUS);
   Serial.println("TFT 初始化完成，图片已显示");
 
-  // WiFi
-  Serial.printf("连接 WiFi：%s\n", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  // WiFi：优先使用 NVS 中保存的凭据；没有凭据或连接失败时自动配网。
+  String storedSsid;
+  String storedPassword;
+  wifiPreferences.begin("wifi", true);
+  storedSsid = wifiPreferences.getString("ssid", "");
+  storedPassword = wifiPreferences.getString("password", "");
+  wifiPreferences.end();
 
-  int timeout = 0;
-  while (WiFi.status() != WL_CONNECTED && timeout < 30) {
-    delay(1000);
-    Serial.print(".");
-    timeout++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\nWiFi OK, IP: %s\n", WiFi.localIP().toString().c_str());
-  } else {
-    Serial.println("\nWiFi 连接超时，继续运行（MQTT 将不可用）");
+  if (!connectStoredWiFi(storedSsid, storedPassword)) {
+    startWiFiProvisioning();
   }
 
   // MQTT
