@@ -342,8 +342,7 @@ EffMeet-Bot/
 ├─ scripts/end_experiment.ps1         # 结束、校验、打开结果目录
 ├─ 开始实验.bat                       # 推荐的明确开始入口
 ├─ 结束实验.bat                       # 推荐的明确结束入口
-├─ README.md
-└─ READ.me
+└─ README.md
 ```
 
 ## 云端音频判断
