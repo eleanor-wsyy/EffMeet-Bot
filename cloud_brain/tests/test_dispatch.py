@@ -7,12 +7,12 @@
 
 用法：
   cd cloud_brain
-  python test_dispatch.py [目标编号...]
+  python -m tests.test_dispatch [目标编号...]
 
 示例：
-  python test_dispatch.py          # 默认模拟 3号和2号发言不足 → 干预顺序 3->2
-  python test_dispatch.py 2        # 只有2号发言不足 → 只提醒2
-  python test_dispatch.py 3 1      # 3号和1号发言不足 → 提醒 3->1
+  python -m tests.test_dispatch          # 默认模拟 3号和2号发言不足 → 干预顺序 3->2
+  python -m tests.test_dispatch 2        # 只有2号发言不足 → 只提醒2
+  python -m tests.test_dispatch 3 1      # 3号和1号发言不足 → 提醒 3->1
 
 在 MQTTX 里：
   订阅 esp32s3/control    <- 看云端发出的 move:<座位>:<表情> 指令

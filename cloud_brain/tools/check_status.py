@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 实时查看各麦克风发言时长和最近一次判定结果。
-用法：python check_status.py
+用法（在 cloud_brain 目录下）：python -m tools.check_status
 """
 
 import io

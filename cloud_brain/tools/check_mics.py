@@ -3,9 +3,9 @@
 麦克风连接自检脚本：确认 4 路 NODE*_MIC 是否真正连上、能否采集到声音。
 
 用法（在 cloud_brain 目录下）：
-    python check_mics.py
-    python check_mics.py --seconds 3      # 每路多采几秒，更准确
-    python check_mics.py --verbose        # 打印每路原始设备信息
+    python -m tools.check_mics
+    python -m tools.check_mics --seconds 3
+    python -m tools.check_mics --verbose
 
 它不只报"设备在不在"，还会真正打开录音流采一段音频，按分贝判断当前有没有声音信号，
 从而帮你区分"设备连上了但没声音"和"根本没识别到"。

@@ -167,7 +167,7 @@ def main():
 
         print(f"\n[验收通过] 连续 {len(args.targets)} 次完整往返全部完成。")
     finally:
-        report_dir = Path(__file__).resolve().parent / "data" / "hardware_tests"
+        report_dir = Path(__file__).resolve().parents[1] / "data" / "hardware_tests"
         report_dir.mkdir(parents=True, exist_ok=True)
         report_path = report_dir / f"stability_{datetime.now():%Y%m%d-%H%M%S}.json"
         report_path.write_text(

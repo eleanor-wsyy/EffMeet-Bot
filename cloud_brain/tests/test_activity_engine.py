@@ -4,21 +4,22 @@ ActivityEngine 离线测试：用合成 int16 音频验证"捂住麦克风不乱
 
 不依赖真实麦克风/VAD，全部用 ActivityEngine 纯逻辑 + RMS 分贝。运行：
     cd cloud_brain
-    python test_activity_engine.py
+    python -m tests.test_activity_engine
 """
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
-try:
-    import numpy as np
-    from core.activity_engine import ActivityEngine
-except ImportError as exc:  # 路径兼容
-    import os
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    os.chdir(os.path.dirname(os.path.abspath(__file__)))
-    import numpy as np
-    from core.activity_engine import ActivityEngine
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+if str(SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SOURCE_ROOT))
+
+import numpy as np
+from core.activity_engine import ActivityEngine
 
 NODES = ["node1", "node2", "node3", "node4"]
 FS = 16000

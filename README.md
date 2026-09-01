@@ -1,44 +1,124 @@
 # EffMeet-Bot
 
-EffMeet-Bot 是一套用于 4 人会议发言统计与机器人干预的系统。每组实验必须经过明确的“开始”和“结束”：开始后同步采集 4 路独立录音并统计每位参会者的累计发言时长，定时判断发言分布是否失衡；需要干预时，ESP32-S3 机器人移动到对应座位，并通过 TFT 表情完成分级提醒。结束后系统封口 WAV、传送到指定路径、逐文件校验，并自动关闭后台。
+EffMeet-Bot 是一套面向 4 人会议实验的本地系统：Windows 电脑同时采集 4 路独立麦克风、累计每人的发言时长并判断是否需要干预；ESP32-S3 机器人通过 MQTT 接收任务，移动到对应座位并显示专注、提醒、好奇或稳定表情。
 
-当前推荐入口：
+当前版本：**EffMeet V1.1 / `v1.1.0`**
+下载地址：[GitHub Releases](https://github.com/eleanor-wsyy/EffMeet-Bot/releases/latest)
 
-- 云端：`cloud_brain/main_brain.py`
-- 机器人：`robot_esp32/1.3/1.3.ino`
+## 先记住四件事
 
-## 系统组成
+1. 双击“启动实验控制台”只会让后台进入就绪状态，**不会录音**。
+2. 只有 4 路麦克风、MQTT、机器人全部在线且机器人空闲时，才能正式开始。
+3. 一组实验必须有明确的 `START` 和 `END`；不能通过拔线或强制关闭后台代替结束。
+4. 只有看到 `EXPERIMENT ENDED AND VERIFIED`，并且最终目录自动打开，才算实验成功。
 
-| 模块 | 职责 |
-| --- | --- |
-| `cloud_brain/` | 明确开始/结束实验，采集并保存 4 路 USB 麦克风，识别人声、累计发言时长、判断是否干预、记录每人的干预次数、通过 MQTT 下发指令，校验并传送实验文件 |
-| `robot_esp32/` | 接收 MQTT 指令、显示表情、控制小车转向和巡线、到达目标后展示干预表情、返程并回传完成状态 |
+## 现场快速开始
 
-## 实验开始与结束
+### 1. 连接并固定四个麦克风
 
-一组实验对应一个后台进程，状态流转固定为：
+四只 USB 麦克风必须使用固定的集线器端口，并在 Windows“声音 → 录制”中命名为：
 
-```text
-尚未开始（不录音）
-  -> 明确开始（4 路录音 + 发言分析 + 干预调度）
-  -> 明确结束（停止采集 -> WAV 封口 -> 等待最后转写）
-  -> 传送至指定路径（大小 + SHA-256 校验）
-  -> 成功后自动关闭后台
+| 集线器端口 | Windows 设备名 | 对应座位 |
+| --- | --- | --- |
+| USB1 | `NODE1_MIC` | `node1` |
+| USB2 | `NODE2_MIC` | `node2` |
+| USB3 | `NODE3_MIC` | `node3` |
+| USB4 | `NODE4_MIC` | `node4` |
+
+同一只麦换到不同 USB 端口后，Windows 可能恢复成“麦克风”，或者继承该端口以前的名字。正式实验前必须重新核对，不能只看实体标签。
+
+改名后关闭声音属性窗口，等待约 5 秒，再重新启动 EffMeet 后台。用便携版自检：
+
+```powershell
+EffMeet_App\check_mics.exe --seconds 3 --verbose
 ```
 
-关键约束：
+源码环境也可以运行：
 
-- 后台启动成功不等于实验开始；在明确开始前不会打开麦克风录音流。
-- 开始实验要求 `NODE1_MIC` 到 `NODE4_MIC`、云端 MQTT、机器人全部在线，且机器人空闲。
-- 点击结束后先禁止新的干预调度，再停止 4 路采集；传送和校验完成前不能把本组视为成功结束。
-- 传送失败时后台不会退出，本机暂存文件不会删除，可修复目标盘或网络路径后重试。
-- WAV 写入/封口完整性失败时系统不会把实验标记为完整，也不会自动删除暂存数据。
+```powershell
+cd cloud_brain
+python -m tools.check_mics --seconds 3 --verbose
+```
+
+只有结论为“4 路全部识别且能采集声音”时才能继续。
+
+### 2. 启动实验控制台
+
+双击仓库根目录的：
+
+```text
+启动实验控制台.bat
+```
+
+浏览器打开 <http://127.0.0.1:5000/>。此时后台已就绪，但实验尚未开始、麦克风尚未录音。
+
+控制台必须同时显示：
+
+- 4/4 麦克风在线；
+- MQTT 已连接；
+- 机器人在线；
+- 机器人空闲；
+- 保存路径可写。
+
+### 3. 明确开始
+
+正式实验双击：
+
+```text
+开始实验.bat
+```
+
+依次完成：
+
+1. 确认录音目标路径；留空则使用 `Documents\EffMeet_Recordings`。
+2. 输入组号；留空则按当天已有目录自动递增。
+3. 输入大写 `START`。
+4. 看到 `EXPERIMENT STARTED: <实验编号>` 后，才宣布实验开始。
+
+只测试四个麦克风、不连接机器人时，可用 `开始实验-仅麦克风.bat`。该入口不是正式机器人实验入口。
+
+### 4. 明确结束
+
+实验结束时双击：
+
+```text
+结束实验.bat
+```
+
+核对实验编号和时长，输入大写 `END`。系统随后按顺序执行：
+
+```text
+停止接收音频
+  -> 等待处理队列清空
+  -> 封口四个 WAV
+  -> 检查帧数、时长和数字静音
+  -> 写入 session 与 manifest
+  -> 复制到目标路径的 .partial 目录
+  -> 逐文件核对大小和 SHA-256
+  -> 原子改名为正式目录
+  -> 删除本机暂存
+  -> 自动关闭后台
+```
+
+任何一步失败，后台都不会把该组标记为成功，也不会删除暂存数据。
+
+## 实验状态机制
+
+```text
+ready       后台就绪，不录音
+recording   已明确开始，四路同步采集
+finalizing  已明确结束，正在封口和完整性检查
+exporting   正在复制并校验目标文件
+exported    已完成且已验证
+error       录音完整性失败，暂存保留
+export_failed  录音完整，但传送失败，可重试传送
+```
+
+后台启动不等于实验开始；实验结束按钮也不等于已经成功。最终状态必须是 `exported`。
 
 ## 当前干预机制
 
-### 1. 座位和节点
-
-系统固定使用 4 个节点：
+### 座位映射
 
 | 节点 | MQTT 目标编号 | 机器人方向 |
 | --- | --- | --- |
@@ -47,861 +127,347 @@ EffMeet-Bot 是一套用于 4 人会议发言统计与机器人干预的系统�
 | `node3` | `3` | 后 |
 | `node4` | `4` | 右 |
 
-云端分别累计 `node1` 到 `node4` 的发言时长。发言时长不会在每轮检查后清零，而是在当前程序会话中持续累积。
+### 检查与判定
 
-### 2. 检查时机
+云端默认每 120 秒检查一次当前实验组的累计发言时长：
 
-云端默认每 `120` 秒执行一次干预检查。可通过启动参数调整：
+1. 若机器人正在移动，本轮跳过。
+2. 若四人总发言时长不超过 5 秒，不移动，显示稳定表情。
+3. 否则计算平均值 `average = total / 4`。
+4. 干预阈值为 `threshold = average × 0.5`。
+5. 找到累计发言最少的人。
+6. 若最低发言时长 `< threshold`，触发移动干预。
+7. 若最低发言时长 `>= threshold`，不移动，显示稳定表情。
 
-```powershell
-python main_brain.py --schedule-interval 60
-```
+发言时长在一组实验内持续累计；明确开始下一组时，发言时长和干预计数归零。
 
-如果机器人正在执行移动任务，本轮检查直接跳过，不会重复下发移动或表情指令。
+### 同一个人的分级干预
 
-### 3. 是否触发干预
+干预计数按参会者分别保存，不是全局共用：
 
-每次检查按以下顺序执行：
-
-1. 计算 4 人总发言时长 `total`。
-2. 如果 `total <= 5` 秒，不触发移动，显示稳定表情。
-3. 否则计算平均发言时长：`average = total / 4`。
-4. 计算干预阈值：`threshold = average × 0.5`。
-5. 找出累计发言最少的人。
-6. 如果最低发言时长 `< threshold`，触发干预。
-7. 如果最低发言时长 `>= threshold`，不触发移动，显示稳定表情。
-
-默认比例 `0.5` 对应 `IMBALANCE_RATIO_THRESHOLD`。当前推荐主程序 `main_brain.py` 在文件顶部定义该值；模块化入口 `main.py` 使用 `config.yaml` 中的 `logic.imbalance_ratio_threshold`。
-
-### 4. 同一人的分级干预
-
-干预次数按参会者分别累计，不是全局共用一个次数：
-
-| 该参会者在当前会话中的干预次数 | 到达后显示的表情 | MQTT 指令 |
+| 同一人在当前实验组中的干预次数 | 到达后表情 | MQTT payload |
 | --- | --- | --- |
 | 第 1 次 | 提醒 | `move:N:reminder` |
 | 第 2 次 | 好奇 | `move:N:curious` |
 | 第 3 次及以后 | 好奇 | `move:N:curious` |
 
-例如，`node3` 第一次被干预不影响 `node2` 的计数。之后即使先干预了其他人，`node3` 再次被选中时仍会使用自己的下一等级。
+例如 `node3` 第一次被干预，不会改变 `node2` 的计数。只有移动指令成功进入调度队列时才保留这次计数；发送失败会回滚。
 
-干预计数只在真正触发移动干预时增加。显示稳定表情不会增加或重置任何人的干预计数。
+### 四种表情
 
-以下情况会把所有人的干预计数归零：
-
-- 重新启动云端主程序。
-- 调用程序内部的会话重置逻辑。
-- 模块化入口重新创建 `MeetingState`。
-
-### 5. 四种表情
-
-| 表情 | 使用时机 | 持续规则 |
+| 表情 | 使用时机 | 持续逻辑 |
 | --- | --- | --- |
-| 专注 `focus` | 开机、等待下一轮检查、机器人移动、机器人返程 | 默认持续显示 |
-| 提醒 `reminder` | 某位参会者第 1 次被干预，机器人到达该座位后 | 显示 4 秒，然后恢复专注 |
-| 好奇 `curious` | 同一参会者第 2 次及以后被干预，机器人到达该座位后 | 显示 4 秒，然后恢复专注 |
-| 稳定 `stable` | 本轮检查没有触发移动干预 | 显示 4 秒，然后自动恢复专注 |
+| 专注 `focus` | 开机、等待、移动、返程 | 默认表情 |
+| 提醒 `reminder` | 同一人第 1 次被干预，到达座位后 | 4 秒后恢复专注 |
+| 好奇 `curious` | 同一人第 2 次及以后被干预，到达座位后 | 4 秒后恢复专注 |
+| 稳定 `stable` | 本轮没有触发移动干预 | 4 秒后恢复专注 |
 
-这里的“稳定”表示“本轮无需移动干预”，包括总发言时长不足和发言分布未达到干预阈值两种情况。
-
-### 6. 完整状态流程
-
-```mermaid
-flowchart TD
-    A["等待阶段：显示专注"] --> B{"到达检查时间"}
-    B --> C{"机器人正在执行任务？"}
-    C -- "是" --> A
-    C -- "否" --> D{"总发言时长 <= 5 秒？"}
-    D -- "是" --> S["显示稳定 4 秒"]
-    D -- "否" --> E["计算平均值和 0.5 倍阈值"]
-    E --> F["选择累计发言最少的人"]
-    F --> G{"最低发言时长 < 阈值？"}
-    G -- "否" --> S
-    G -- "是" --> H["该参会者干预次数 +1"]
-    H --> I{"是否第 1 次？"}
-    I -- "是" --> J["发送 move:N:reminder"]
-    I -- "否" --> K["发送 move:N:curious"]
-    J --> L["显示专注并移动到目标"]
-    K --> L
-    L --> M["到达后显示指定表情 4 秒"]
-    M --> N["恢复专注并返程"]
-    N --> O["发布 done 回包"]
-    O --> A
-    S --> A
-```
-
-### 7. 判定示例
-
-假设当前累计发言时长为：
-
-```text
-node1 = 100 秒
-node2 = 10 秒
-node3 = 0 秒
-node4 = 15 秒
-```
-
-计算结果：
-
-```text
-total = 125 秒
-average = 125 / 4 = 31.25 秒
-threshold = 31.25 × 0.5 = 15.625 秒
-最低发言者 = node3，发言 0 秒
-0 < 15.625，因此触发干预
-```
-
-- 如果这是 `node3` 第 1 次被干预，发送 `move:3:reminder`。
-- 如果这是 `node3` 第 2 次或更多次被干预，发送 `move:3:curious`。
+一句话概括：**等待显示专注；第一次干预显示提醒；同一人第二次及以后显示好奇；没有触发干预显示稳定。**
 
 ## MQTT 协议
 
-默认 Broker：
+默认 Broker：`broker.emqx.io:1883`
 
-```text
-broker.emqx.io:1883
-```
-
-公开 Broker 适合演示和联调，不建议长期生产使用。
-
-### 主题
-
-| 方向 | 主题 | 用途 |
+| 方向 | Topic | 用途 |
 | --- | --- | --- |
-| 云端 -> 机器人 | `esp32s3/control` | 移动指令和单独的表情指令 |
-| 机器人 -> 云端 | `esp32s3/status` | 在线状态、表情确认、完成回包和故障回包 |
-| 云端 -> 上层系统 | `effmeet/cycle/done` | 当前干预序列完成通知 |
+| 云端 → 机器人 | `esp32s3/control` | 移动和表情指令 |
+| 机器人 → 云端 | `esp32s3/status` | 在线、确认、完成和错误状态 |
+| 云端 → 上层系统 | `effmeet/cycle/done` | 一轮干预完成通知 |
 
 ### 移动指令
-
-推荐格式：
 
 ```text
 move:<目标编号>:<到达后表情>
 ```
 
-有效示例：
+示例：
 
 ```text
 move:1:reminder
 move:2:curious
-move:3:reminder
-move:4:curious
 ```
 
-约束：
-
-- 目标编号只能是 `1`、`2`、`3`、`4`。
-- 移动指令中的表情只能是 `reminder` 或 `curious`。
-- `move:N` 省略表情时默认使用 `reminder`。
-- 旧版纯数字 `1` 到 `4` 仍兼容，等价于 `move:N:reminder`。
-- 机器人执行任务期间不会接受新的移动或表情指令。
-
-云端负责决定使用 `reminder` 还是 `curious`。机器人只执行 payload 中指定的表情，不在本地累计某位参会者的干预次数。
+目标只能是 `1` 到 `4`；移动表情只能是 `reminder` 或 `curious`。兼容旧格式 `move:N` 和纯数字 `N`，它们默认使用提醒表情。
 
 ### 单独切换表情
 
-格式：
-
 ```text
-expr:<表情名称>
+expr:focus
+expr:reminder
+expr:curious
+expr:stable
 ```
 
-支持的指令：
+机器人忙碌时不会接受新的移动任务。`stable`、`reminder`、`curious` 显示 4 秒后恢复专注。
 
-| payload | 行为 |
-| --- | --- |
-| `expr:focus` | 显示专注，持续到下一条有效指令 |
-| `expr:stable` | 显示稳定 4 秒，然后自动恢复专注 |
-| `expr:reminder` | 显示提醒，持续到下一条有效指令 |
-| `expr:curious` | 显示好奇，持续到下一条有效指令 |
-
-单独发送表情指令只改变 TFT 显示，不移动机器人，也不改变云端保存的干预次数。
-
-### 完成回包
-
-机器人完成返程后，在 `esp32s3/status` 发布：
+### 常见状态回包
 
 ```text
-done|dir=<当前朝向>|target=<本次目标>|expression=<本次干预表情>
+online
+expr_ack|expression=focus|frame=12
+done|dir=2|target=3|expression=reminder
+error|stage=track|reason=timeout
 ```
 
-示例：
-
-```text
-done|dir=3|target=1|expression=curious
-```
-
-字段含义：
-
-| 字段 | 含义 |
-| --- | --- |
-| `dir` | 机器人完成返程后的当前朝向，不是本次目标编号 |
-| `target` | 本次移动的目标编号 |
-| `expression` | 到达目标后实际显示的干预表情 |
-
-云端收到以 `done` 开头的回包后解除忙碌状态，并发布：
-
-```text
-主题：effmeet/cycle/done
-payload：cycle_done
-```
-
-云端会核对 `target` 和 `expression` 是否与当前在途任务一致。重连后迟到的旧 `done` 不会推进新任务。
-
-### 在线、表情确认和故障回包
-
-机器人连接成功后发布保留消息 `online`；意外断线时 Broker 通过 Last Will 把同一主题更新为 `offline`。
-
-单独表情绘制完成后发布：
-
-```text
-ack|type=expression|expression=<表情>|frame=<累计完整帧数>
-```
-
-运动阶段找不到计数线或轨迹并达到安全超时时，机器人立即停止电机、恢复专注表情并发布：
-
-```text
-error|target=<目标编号>|phase=<失败阶段>
-```
-
-云端收到 `error` 后会自动解除忙状态，并撤销本次未完成的干预计数，不需要人工杀后台。云端等待 `done` 超过 180 秒也会自动恢复。
-
-### 典型消息时序
-
-某人第 1 次被干预：
-
-```text
-云端 -> esp32s3/control : move:3:reminder
-机器人到达 node3       : 显示提醒 4 秒
-机器人 -> esp32s3/status: done|dir=X|target=3|expression=reminder
-云端 -> effmeet/cycle/done: cycle_done
-```
-
-同一人第 2 次被干预：
-
-```text
-云端 -> esp32s3/control : move:3:curious
-机器人到达 node3       : 显示好奇 4 秒
-机器人 -> esp32s3/status: done|dir=X|target=3|expression=curious
-云端 -> effmeet/cycle/done: cycle_done
-```
-
-本轮不触发干预：
-
-```text
-云端 -> esp32s3/control : expr:stable
-机器人                  : 显示稳定 4 秒，然后恢复专注
-```
+云端会核对 `done` 中的目标和表情，过期或不匹配的回包不能完成当前任务。
 
 ## 目录结构
 
 ```text
 EffMeet-Bot/
-├─ cloud_brain/
-│  ├─ main_brain.py                  # 当前推荐的云端主程序
-│  ├─ experiment_recording.py         # 4 路 WAV 暂存、封口、校验和传送
-│  ├─ windows_setup.py               # Windows Wi-Fi 扫描、切换、恢复与配网提交
-│  ├─ main.py                        # 模块化版本入口
-│  ├─ config.yaml                    # 模块化入口的 MQTT 和调度参数
-│  ├─ requirements.txt               # Python 依赖
-│  ├─ EffMeet.spec                   # PyInstaller 打包配置
-│  ├─ templates/dashboard.html        # 明确开始/结束实验控制台
-│  ├─ check_status.py                # 终端状态查看器
-│  ├─ list_mics.py                   # 列出本机输入设备
-│  ├─ check_mics.py                  # 麦克风连接自检（逐个录音测分贝）
-│  ├─ core/
-│  │  ├─ activity_engine.py          # robust 人声判定状态机（自适应底噪+主导说话人）
-│  │  ├─ vad_engine.py               # Silero VAD 封装（可禁用）
-│  │  └─ speaker_id.py               # 预留模块
-│  ├─ logic/
-│  │  ├─ meeting_state.py            # 模块化会议统计与干预逻辑
-│  │  └─ commander.py                # 预留模块
-│  ├─ network/
-│  │  └─ mqtt_manager.py             # 模块化 MQTT 封装
-│  ├─ utils/
-│  │  ├─ audio_buffer.py             # 音频缓冲与 VAD 过滤
-│  │  └─ report_gen.py               # Excel 报表生成
-│  ├─ test_activity_engine.py         # robust 人声判定离线测试
-│  ├─ test_hardware_stability.py      # 4 种表情 + 连续 5 次往返验收
-│  ├─ test_experiment_recording.py    # 录音格式、命名、校验和重试测试
-│  ├─ test_experiment_lifecycle.py    # HTTP 开始/结束/自动关后台测试
-│  ├─ test_device_setup.py           # 设备连接向导解析与恢复闭环测试
-│  └─ test_*.py                       # 其他联调和行为测试
+├─ cloud_brain/                    # Windows 云端源码
+│  ├─ main_brain.py                # 推荐主程序与 Web/API/MQTT 调度
+│  ├─ experiment_recording.py      # 四路录音、完整性检查和传送
+│  ├─ windows_setup.py             # Windows Wi-Fi 配网与恢复
+│  ├─ main.py                      # 模块化备用入口
+│  ├─ config.yaml                  # 模块化入口配置
+│  ├─ requirements.txt             # 完整源码依赖
+│  ├─ core/                        # 音频与人声判定
+│  ├─ logic/                       # 会议状态和干预逻辑
+│  ├─ network/                     # MQTT 封装
+│  ├─ utils/                       # 音频缓冲和报表工具
+│  ├─ templates/                   # 实验控制台页面
+│  ├─ tools/                       # 麦克风与状态诊断工具
+│  ├─ tests/                       # 自动测试和硬件验收脚本
+│  └─ packaging/                   # PyInstaller 配置与精简依赖
 ├─ robot_esp32/
-│  └─ 1.3/
-│     ├─ 1.3.ino                     # ESP32-S3 机器人固件
-│     ├─ image_array.h               # 专注表情位图
-│     ├─ reminder_image.h            # 提醒表情位图
-│     ├─ curious_image.h             # 好奇表情位图
-│     ├─ stable_image.h              # 稳定表情位图
-│     ├─ reminder.png                # 提醒表情预览
-│     ├─ curious.png                 # 好奇表情预览
-│     ├─ stable.png                  # 稳定表情预览
-│     └─ User_Setup.h                 # Arduino_GFX 实际接线参考
-├─ scripts/start_effmeet.ps1          # 启动或复用就绪后台
-├─ scripts/begin_experiment.ps1       # 开始实验的确认与接口调用
-├─ scripts/end_experiment.ps1         # 结束、校验、打开结果目录
-├─ scripts/build_firmware.ps1         # 固定英文缓存路径的单进程固件构建/烧录
-├─ 开始实验.bat                       # 推荐的明确开始入口
-├─ 结束实验.bat                       # 推荐的明确结束入口
+│  └─ 1.3/                         # Arduino 草图；目录名必须与 1.3.ino 匹配
+├─ EffMeet_App/                    # 已打包的 Windows 便携版
+├─ scripts/                        # 启动、结束和固件构建脚本
+├─ 启动实验控制台.bat
+├─ 开始实验.bat
+├─ 开始实验-仅麦克风.bat
+├─ 结束实验.bat
 └─ README.md
 ```
 
-## 云端音频判断
+顶层公共路径保持不变，避免破坏现有便携版、Arduino 烧录脚本和同学已经保存的快捷方式。
 
-默认（`--detect-mode robust`）的判定由 `cloud_brain/core/activity_engine.py` 的
-`ActivityEngine` 承担，`main_brain.py` 的音频线程逐块喂入 4 路分贝并取出判定结果：
+## Windows 便携版与源码运行
 
-1. 自动识别名称包含 `NODE1_MIC` 到 `NODE4_MIC` 的 4 路输入设备。
-2. 每路维护一个**自适应底噪**，环境噪声漂移时缓慢跟随，不写死一次性校准值。
-3. 全局用**双门限 VAD** 判断"整场是否有持续人声"，带静音容忍（说话中的短暂停顿不误停）。
-4. **主导说话人归属**：只在"确实在说话"的前提下，把连续超阈值且稳定的那路判为主说话人；
-   切换跳转需要持续证据（`lead_confirm`），串音/单个尖峰不会抢归属——因此"捂住麦克风
-   不说话不会乱计时"。
-5. 只给当前主导说话人累计时长，并将分贝/底噪/归属写入 `latest_audio_state` 供排查。
-6. 若开启语音转写（默认 `--no-whisper` 关闭），把语音片段交给 Faster-Whisper 转写。
-7. 通过 Flask 接口暴露当前状态。
+### 便携版
 
-判定参数（可调）位于 `main_brain.py` 顶部：
+下载 Release 后必须完整解压，不能只复制 `EffMeet.exe`。程序依赖同目录下的 `_internal`：
 
 ```text
-SPEECH_HI_DB = 10.0     # 双门限开口高门限（相对底噪）
-SPEECH_LO_DB = 6.0      # 双门限维持低门限（相对底噪）
-FLOOR_ALPHA = 0.03      # 自适应底噪时间常数
-VAD_MAX_SIL = 3         # 全局 VAD 静音容忍块数
-DOM_HANGOVER = 3        # 主导者静音容忍块数
-DOM_LEAD_CONFIRM = 2    # 主导者接管前需持续块数
+EffMeet_App/
+├─ EffMeet.exe
+├─ check_mics.exe
+└─ _internal/
 ```
 
-如果某一路麦克风长期偏大或偏小，可调整 `main_brain.py` 中的：
+仓库中的 `cloud_brain/.venv` 只属于创建它的电脑，不能随压缩包复制到其他电脑运行。跨电脑使用应选择 Release 里的便携版，或在目标电脑重新创建虚拟环境。
 
-```python
-MIC_GAIN_OFFSETS_DB = {
-    "node1": 0.0,
-    "node2": 0.0,
-    "node3": 0.0,
-    "node4": 0.0,
-}
-```
-
-## 机器人任务流程
-
-机器人收到 `move:N:expression` 后：
-
-1. 将状态设为忙碌，并显示专注表情。
-2. 根据当前朝向和目标编号计算需要旋转的步数。
-3. 对线后巡线前往目标；全程持续服务 MQTT 保活。
-4. 到达后停止，硬复位 TFT 并完整显示指定的提醒或好奇表情。
-5. 停留 4 秒。
-6. 恢复专注表情，原地掉头并巡线返回起点。
-7. 停止电机，再次复位 TFT 并完整绘制专注表情。
-8. 更新当前朝向。
-9. 发布 `done` 回包；若当时断线则暂存，重连后自动补发。
-10. 解除忙碌状态，继续等待下一条指令。
-
-TFT 使用整屏地址窗口连续写入 480×320 像素，不再逐像素重复设置地址。该改动显著缩短刷新时间，避免网络保活被长时间占用，也降低只完成半屏刷新的概率。
-
-## 运行环境
-
-### 云端
-
-- Windows 10 / 11
-- Python 3.10+（源码运行）
-- 4 路 USB 麦克风
-- 可访问 MQTT Broker 的网络
-
-> 不想装 Python？可以直接用打包好的 exe（见下节"打包与分发"），双击即启动，目标电脑免装 Python。
-
-### 打包与分发
-
-**现成可运行版本就在仓库根目录 `EffMeet_App/`**，免装 Python，拷贝即用：
-
-- 双击 `EffMeet_App/EffMeet.exe` 即启动后台（等价 `python main_brain.py --no-whisper --no-vad`），
-  浏览器开 <http://127.0.0.1:5000/> 使用。
-- `EffMeet_App/check_mics.exe` 是麦克风自检工具，双击即可确认 4 路 NODE*_MIC 是否连上、有声音。
-- 把整个 `EffMeet_App/` 目录拷贝到任意一台 Windows 电脑即可运行。
-- 控制台内置“设备连接向导”：换电脑或换场地 Wi-Fi 时直接在同一页面检查电脑网络、
-  MQTT、机器人和 4 路麦克风，并完成机器人配网；普通实验人员不需要安装 Arduino。
-
-也可从 GitHub Release 下载打包好的 zip：
-
-```text
-https://github.com/eleanor-wsyy/EffMeet-Bot/releases
-```
-
-> 说明：exe 缺省剥离 Whisper 转写与 torch，但保留录音 + 人声判定 + 机器人干预
-> （robust 判定不依赖 torch）。若需语音转写，请在本机装有 Python 与完整依赖的环境下
-> 源码运行 `python main_brain.py`。
-
-本地重新打包（生成新的 `EffMeet_App/`）：
-
-```powershell
-cd cloud_brain
-python -m pip install pyinstaller -r requirements_pack.txt   # 不含 torch/whisper
-python -m PyInstaller EffMeet.spec --noconfirm --clean
-# 把生成物复制到仓库根：copy cl_brain..\dist 见下注释
-```
-
-打包环境要求常规 Python（微软商店版 Python 无法被 PyInstaller 打包，请用 python.org 或
-Anaconda 安装版）。`requirements_pack.txt` 提供不含 torch/whisper 的依赖清单：
-`paho-mqtt numpy pandas openpyxl PyYAML sounddevice Flask`。
-
-### 机器人端
-
-- ESP32-S3 开发板
-- L298N 电机驱动模块
-- 左右直流减速电机
-- 5 路循迹传感器
-- 1 路红外计数传感器
-- 3.5 英寸 ILI9488 TFT LCD
-
-已验证可编译的 Arduino 依赖：
-
-- 开发板核心：`esp32:esp32 3.0.7`
-- `PubSubClient 2.8.0`
-- `GFX Library for Arduino 1.5.0`
-
-`GFX Library for Arduino 1.6.7` 使用了更新的 ESP LCD API，不能与 `esp32:esp32 3.0.7` 组合编译。升级 GFX 时需要同时升级 ESP32 核心。
-
-## 快速开始
-
-### 1. 配置麦克风名称
-
-在 Windows 录音设备中，把 4 个输入设备重命名为：
-
-```text
-NODE1_MIC
-NODE2_MIC
-NODE3_MIC
-NODE4_MIC
-```
-
-### 2. 安装云端依赖
+### 源码运行
 
 ```powershell
 cd cloud_brain
 python -m venv .venv
-.\.venv\Scripts\activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+.\.venv\Scripts\python -m pip install -r requirements.txt
+.\.venv\Scripts\python main_brain.py
 ```
 
-### 3. 检查麦克风
+手动启动 `main_brain.py` 后仍然只是就绪状态，必须在控制台或 API 中明确开始实验。
 
-先 `list_mics.py` 列出输入设备：
+### 重新打包
+
+在常规 Python 环境中运行：
 
 ```powershell
 cd cloud_brain
-python list_mics.py
+python -m pip install pyinstaller -r packaging\requirements_pack.txt
+python -m PyInstaller packaging\EffMeet.spec --noconfirm --clean
 ```
 
-再用 `check_mics.py` 真正逐个打开录音流、测量分贝，确认"设备在"且"有声音"（而不是
-只列出设备）：
+输出位于 `cloud_brain/dist/EffMeet/`。验证 `EffMeet.exe` 和 `check_mics.exe` 后，再整体替换仓库根目录的 `EffMeet_App/`。
+
+打包版默认不含 Faster-Whisper 和 Torch，但保留四路录音、人声判定、干预调度和 Wi-Fi 配网。
+
+## 机器人固件
+
+固件入口：`robot_esp32/1.3/1.3.ino`
+
+### 编译与烧录
 
 ```powershell
-cd cloud_brain
-python check_mics.py
-python check_mics.py --seconds 3      # 每路多测几秒更稳
-python check_mics.py --verbose        # 额外打印所有输入设备
-```
-
-输出会区分 ✅ 有声音 / ⚠️ 静音疑似无信号 / ❌ 未识别到。确认 4 路都 `✅` 即可。打包版
-双击 `check_mics.exe` 也能自检，无需装 Python。
-
-### 4. 首次开发：编译并烧录机器人（每台机器人只做一次）
-
-这一步只由开发人员执行。普通实验人员日常换电脑、换 Wi-Fi **不要重新烧录**。只有更换
-ESP32、清空整片闪存或以后升级固件时，才需要再次执行本节。
-
-稳定构建入口：
-
-```powershell
-# 只编译；固定使用 C:\EffMeetBuild\esp32s3，并复用持久缓存
+# 只编译
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build_firmware.ps1
 
-# 首次开发烧录；多串口时必须明确指定，避免烧错设备
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build_firmware.ps1 -Upload -Port COM6
+# 编译并烧录；必须明确串口，避免烧错设备
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build_firmware.ps1 -Upload -Port COM7
 ```
 
-该入口使用命名互斥锁，确保同一时刻只有一个 `arduino-cli` 写构建目录；默认 4 个编译
-job。它不会修改全局安装的 GFX 1.5.0，而是在 `C:\EffMeetBuild\libraries` 生成不提交到
-仓库的最小临时副本，只编译本固件实际使用的 `Arduino_G`、`Arduino_GFX`、`Arduino_DataBus`、
-`Arduino_TFT`、`Arduino_SWPAR8` 和 `Arduino_ILI9488`。构建、烧录和重启串口日志均保存在
-`C:\EffMeetBuild\logs`。Windows 用户名含中文时，脚本会在构建期间自动映射一个空闲的英文
-盘符给 Arduino 数据目录，并在结束后解除。如确实需要完全重建才加 `-Clean`，日常不要清缓存或切换目录。
+脚本使用固定英文路径 `C:\EffMeetBuild`，兼容中文 Windows 用户名并复用 Arduino 缓存。日常更换 Wi-Fi 不需要重新烧录。
 
-固件仍位于 `robot_esp32/1.3/1.3.ino`，需确认：
+### 当前接线定义
 
-- WiFi 不再写死在代码中；首次烧录后通过配网热点填写 SSID 和密码。
-- MQTT Broker 和主题与云端一致。
-- 开发板选择 ESP32-S3。
-- Arduino 库版本与上方验证版本一致。
-- TFT `RST` 接在 **IO42**。旧说明中的 IO33 已废弃，不能继续按旧表接线。
-- TFT 数据线 `D7` 接在 **GPIO18**。旧版本使用的 GPIO19 已废弃。
+TFT 8 位并口：
 
-烧录后通过串口确认 Wi-Fi、MQTT 和 TFT 初始化成功。
-
-#### 日常使用：在 EffMeet.exe 内换 Wi-Fi（不烧录）
-
-固件会把 Wi-Fi 凭据保存到 ESP32 的 NVS 闪存中。以后更换电脑、场地 Wi-Fi 或密码时：
-
-1. 双击 `EffMeet_App/EffMeet.exe`，打开 <http://127.0.0.1:5000/>。
-2. 查看“设备连接向导”。它会同时显示电脑联网、MQTT、机器人和 4 路麦克风状态。
-3. 机器人离线时，给机器人重新上电并等待约 30 秒；点击“扫描附近 Wi-Fi”，选择
-   `EffMeet-Setup-XXXX`，填写场地 Wi-Fi 名称和密码。
-4. 点击“连接机器人并自动恢复电脑网络”。程序会短暂连接机器人热点、调用固件现有
-   `/save` 写入 NVS、恢复电脑原网络，再等待 MQTT 和机器人上线。
-5. 所有检查通过后，“明确开始实验并录音”才可点击。
-
-密码只发送给本地机器人，不写入日志、仓库或控制台状态。必须注意：
-
-- ESP32 只支持 **2.4 GHz**；只发现 5/6 GHz 的网络会被向导拒绝。
-- 校园/企业账号认证、网页认证或证书网络不能只靠 SSID 和密码接入。
-- 电脑能上网不代表 MQTT 可用；校园网或防火墙封锁 TCP 1883 时，向导会明确报告
-  “电脑联网但 MQTT 不可用”。
-
-若自动向导因 Windows 无线网卡权限或驱动失败，仍可使用固件原生手动方式：
-
-1. 首次启动，或设备连接已保存的 WiFi 失败后，打开手机/电脑的 WiFi 列表。
-2. 连接设备发出的热点 `EffMeet-Setup-XXXX`，热点密码为 `EffMeet123`。
-3. 浏览器打开 <http://192.168.4.1/>，填写现场 WiFi 名称和密码，点击“保存并重启”。
-4. 设备重启后会自动连接新 WiFi，并在串口输出新的设备 IP。
-
-设备已经连上旧 WiFi 时，也可以直接访问串口输出的 `http://设备IP/` 修改 WiFi；页面的“清除已保存 WiFi”按钮会清除凭据并重启进入配网模式。
-
-### 5. 明确开始实验（推荐）
-
-直接双击仓库根目录的：
-
-```text
-开始实验.bat
-```
-
-脚本严格按以下顺序执行：
-
-1. 自动启动后台；如果本机已有健康的 EffMeet 后台则直接复用。
-2. 最多等待 120 秒，直到 4 路麦克风、云端 MQTT 和机器人全部在线。
-3. 要求填写录音传送目标路径；直接回车使用默认路径。
-4. 要求填写本组组号；直接回车则按当天已完成实验自动递增。
-5. 要求输入完全一致的大写 `START`。只有确认成功后才调用开始接口并打开 4 路录音。
-6. 开始成功后显示实验编号并打开控制台。
-
-如果取消或确认文字不正确，后台可保持就绪，但不会开始录音。启动日志保存在 `cloud_brain/data/logs/`。
-
-控制台地址为 <http://127.0.0.1:5000/>。
-
-### 6. 明确结束实验（推荐）
-
-实验确实结束时，双击：
-
-```text
-结束实验.bat
-```
-
-脚本会显示当前实验编号和已录制时间，并要求输入完全一致的大写 `END`。确认后：
-
-1. 立即停止 4 路录音和新的干预调度。
-2. 完整封口 4 个 WAV。
-3. 清空当前音频分析队列并等待最后的语音转写，最长等待 30 秒。
-4. 把录音、会话记录和校验清单传送到开始时指定的路径。
-5. 对每个文件核对字节大小和 SHA-256。
-6. 成功后显示并打开最终目录，后台约 3 秒后自动关闭。
-
-如果输入的不是 `END`，录音继续进行。结束脚本等待收尾的接口超时为 180 秒，请勿在“正在封口、传送并校验”期间关闭窗口或强制结束后台。
-
-### 7. 控制台操作（备用）
-
-也可以先运行：
-
-```powershell
-.\scripts\start_effmeet.ps1
-```
-
-然后在网页中填写目标路径和组号，点击“明确开始实验并录音”；结束时点击“明确结束实验”。网页会显示以下互斥状态：
-
-- `尚未开始 · 当前不录音`
-- `实验进行中 · 正在录音`
-- `实验正在明确结束 · 请勿关闭`
-- `实验已明确结束 · 文件已校验`
-- `实验已停止 · 等待重新传送`
-- `实验已停止 · 录音完整性异常`
-
-### 8. 手动启动后台（调试备用）
-
-```powershell
-cd cloud_brain
-python main_brain.py
-```
-
-启动成功后会输出：
-
-```text
-[READY] 后台已就绪，但实验尚未开始，当前不会录音。
-```
-
-手动启动后台后，仍必须在网页中明确开始实验。
-
-### 9. 查看实时状态
-
-另开一个终端：
-
-```powershell
-cd cloud_brain
-python check_status.py
-```
-
-也可以保持浏览器中的实验控制台打开，它每秒刷新 4 路录音时长、4 人发言时长、干预次数、MQTT、机器人和实验生命周期状态。
-
-## 录音目录、命名与传送保证
-
-默认传送目标：
-
-```text
-C:\Users\<用户名>\Documents\EffMeet_Recordings
-```
-
-开始时可改为任意可写的绝对路径，例如移动硬盘或已挂载的网络盘。程序先创建并读回一个探测文件，确认目标可写后才允许实验开始。
-
-实验目录使用电脑本地日期时间和组号命名：
-
-```text
-YYYYMMDD_HHMMSS_groupNNN
-```
-
-例如第 2 组在 2026-08-04 16:19:06 开始：
-
-```text
-20260804_161906_group002
-```
-
-组号留空时，程序扫描目标路径中当天已完成的实验目录，使用最大组号加 1。每个最终目录固定包含：
-
-```text
-20260804_161906_group002_node1.wav
-20260804_161906_group002_node2.wav
-20260804_161906_group002_node3.wav
-20260804_161906_group002_node4.wav
-20260804_161906_group002_session.json
-20260804_161906_group002_manifest.json
-```
-
-4 个录音文件均为独立单声道 PCM WAV：`16000 Hz`、`16-bit`、`mono`。`session.json` 保存发言统计、转写、干预计数和事件；`manifest.json` 保存实验编号、开始/结束时间、各通道帧数/时长、文件大小与 SHA-256。
-
-录音不会直接写入移动盘或网络盘，而是先写入本机 `cloud_brain/data/recording_staging/`。结束时先把所有文件复制到目标路径中的隐藏 `.partial` 目录，逐文件核对大小和 SHA-256，全部通过后再在同一目标根目录中改名为正式实验目录。只有正式目录发布成功后才删除本机暂存。
-
-### 传送失败与恢复
-
-- 目标盘断开、网络路径失联、复制或 SHA-256 校验失败：状态变为 `export_failed`，后台继续运行，暂存保留；重新接好目标后点击“重试传送并校验”。
-- 音频分析/最后转写未能在限定时间完成：已封口的 WAV 仍保留，状态进入可重试传送；重试时重新取得最新会话快照。
-- WAV 写入、音频块完整性或封口失败：状态变为 `error`，后台不退出、暂存不删除，但系统拒绝把该组标为“完整”；应记录控制台显示的暂存路径并人工检查。
-- 最终目录已经逐文件校验成功、但本机暂存副本删除失败：实验仍标记为成功并返回明确警告；可核对最终目录后人工删除该暂存副本。
-- 人工按 `Ctrl+C` 或进程意外终止：程序尽量停止并封口录音，暂存目录保留，不会伪装成已校验的最终目录。
-
-## 连续多组 4 人实验
-
-每组使用独立后台生命周期，避免上一组的录音、延迟转写或内存状态混入下一组：
-
-1. 第 1 组双击 `开始实验.bat`，输入路径、组号并确认 `START`。
-2. 第 1 组结束时双击 `结束实验.bat`，确认 `END`。
-3. 等待脚本显示“EXPERIMENT ENDED AND VERIFIED”、打开最终目录，并让后台自动关闭。
-4. 核对最终目录中的 4 个 WAV、`session.json` 和 `manifest.json`。
-5. 更换下一组参与者后，再次双击 `开始实验.bat`；留空组号即可自动递增。
-
-不要使用旧的“归档并开始下一组”方式。兼容接口 `/api/session/reset` 仍保留，但正式实验录音期间会被拒绝，也不是推荐流程。
-
-## 调试参数
-
-```powershell
-python main_brain.py --smoke
-python main_brain.py --no-mic
-python main_brain.py --loose-thresholds
-python main_brain.py --schedule-interval 60
-python main_brain.py --no-mic --schedule-interval 10 --demo-state node1=100,node2=10,node3=0,node4=15
-python main_brain.py --no-whisper --no-vad     # 剥离 torch，仅录音+人声判定+干预
-python main_brain.py --detect-mode legacy      # 回退到旧瞬时判定
-```
-
-| 参数 | 说明 |
+| TFT | ESP32-S3 |
 | --- | --- |
-| `--smoke` | 只检查麦克风是否可识别，不启动 Web、MQTT 和音频线程 |
-| `--no-mic` | 不打开麦克风流，保留 Web 和 MQTT 调度，适合联调 |
-| `--loose-thresholds` | 放宽音频判定阈值，适合现场调试 |
-| `--schedule-interval` | 修改干预检查间隔，单位为秒 |
-| `--demo-state` | 注入测试发言时长；当前应与 `--no-mic` 配合使用 |
-| `--detect-mode {robust,legacy}` | 说话人判定模式，默认 `robust`（自适应底噪+主导说话人+静音容忍）；`legacy` 保留旧瞬时判定 |
-| `--no-whisper` | 不启动语音转写线程，不加载 faster-whisper/torch |
-| `--no-vad` | 不初始化 Silero VAD，不加载 torch；robust 判定本身不依赖 VAD |
+| `DC` | GPIO36 |
+| `CS` | GPIO35 |
+| `WR` | GPIO37 |
+| `RD` | GPIO38 |
+| `RST` | GPIO42 |
+| `D0`–`D7` | GPIO2、3、8、9、10、11、12、18 |
 
-> PyInstaller 打包的 exe 默认即"无 whisper + 无 VAD"（`sys.frozen` 时自动为真），因此双击
-> exe 就有录音 + 人声判定 + 机器人干预，无需额外传参。
+注意：`D7` 当前是 **GPIO18**，GPIO19 已废弃；`RST` 当前是 **GPIO42**。
 
-## 本地状态接口
+L298N：
 
-云端启动后开放：
+| L298N | ESP32-S3 | 电机 |
+| --- | --- | --- |
+| `IN1` / `IN2` | GPIO21 / GPIO47 | 右轮方向 |
+| `ENA` | GPIO40 | 右轮 PWM |
+| `IN3` / `IN4` | GPIO14 / GPIO13 | 左轮方向 |
+| `ENB` | GPIO41 | 左轮 PWM |
+
+五路循迹传感器 `FL / ML / MID / MR / FR` 分别接 GPIO4 / 5 / 6 / 7 / 15，计数传感器接 GPIO1。所有模块必须共地。
+
+## Wi-Fi 配置
+
+Wi-Fi 凭据保存在 ESP32 NVS 中，不写死在固件。更换场地网络时：
+
+1. 启动 EffMeet 控制台。
+2. 在“设备连接向导”中扫描附近 Wi-Fi。
+3. 选择机器人热点 `EffMeet-Setup-XXXX`。
+4. 填写目标 2.4 GHz Wi-Fi 和密码。
+5. 点击“连接机器人并自动恢复电脑网络”。
+
+程序会临时连接机器人热点、把凭据发送给本地机器人、恢复电脑原网络，再等待 MQTT 和机器人上线。密码不会写入仓库或日志。
+
+手动配网备用方式：连接 `EffMeet-Setup-XXXX`，热点密码 `EffMeet123`，浏览器打开 <http://192.168.4.1/>。
+
+ESP32 只支持 2.4 GHz。校园网页认证、账号认证或证书网络不能只靠 SSID 和密码完成连接；防火墙还可能单独拦截 MQTT TCP 1883。
+
+## 录音目录与文件
+
+默认最终目录：
 
 ```text
-GET http://127.0.0.1:5000/api/get_meeting_data
+C:\Users\<用户名>\Documents\EffMeet_Recordings\
+└─ YYYYMMDD_HHMMSS_groupNNN\
+   ├─ YYYYMMDD_HHMMSS_groupNNN_node1.wav
+   ├─ YYYYMMDD_HHMMSS_groupNNN_node2.wav
+   ├─ YYYYMMDD_HHMMSS_groupNNN_node3.wav
+   ├─ YYYYMMDD_HHMMSS_groupNNN_node4.wav
+   ├─ YYYYMMDD_HHMMSS_groupNNN_session.json
+   └─ YYYYMMDD_HHMMSS_groupNNN_manifest.json
 ```
 
-返回内容包括：
+源码版暂存通常位于 `cloud_brain/data/recording_staging/`；便携版暂存位于 `EffMeet_App/_internal/data/recording_staging/`。这些目录包含参与者声音，不应提交 GitHub。
 
-- `current_speaking_times`
-- `total_speaking_time`
-- `latest_records`
-- `latest_speaking_events`
-- `latest_audio_state`
-- `session_id` / `session_started_at`
-- `intervention_counts`
-- `robot_busy` / `mqtt_connected` / `robot_online`
-- `next_schedule_check_at`
-- `experiment` / `experiment_active` / `default_output_dir`
+### 失败处理
 
-其他本地接口：
+- `export_failed`：四路录音已完整封口，但目标盘或网络路径传送失败；修复路径后使用控制台“重试传送”。
+- `error`：录音本身不完整，例如某路没有音频、长期数字静音、帧数明显不一致、四路在实验结束前提前停止；不能标记成功，也不能用传送重试掩盖。
+- 任何失败都先记录控制台显示的 `staging_dir`，不要删除暂存、不要覆盖同名目标目录。
 
-```text
-GET  /api/health
-POST /api/experiment/start
-POST /api/experiment/end
-POST /api/experiment/retry-export
-POST /api/session/reset
+## 测试
+
+在 `cloud_brain` 目录运行自动测试：
+
+```powershell
+python -m tests.test_activity_engine
+python -m tests.test_intervention_expressions
+python -m tests.test_experiment_recording
+python -m tests.test_experiment_lifecycle
+python -m tests.test_session_management
+python -m tests.test_device_setup
 ```
 
-开始接口的 JSON 请求体：
+现场硬件测试：
+
+```powershell
+# 四路麦克风逐路采样
+python -m tools.check_mics --seconds 3 --verbose
+
+# 只检查四种表情
+python -m tests.test_hardware_stability --expression-only
+
+# 表情预检 + 1→2→3→4→1 共五次往返
+python -m tests.test_hardware_stability
+```
+
+MQTT 调度联调：
+
+```powershell
+python -m tests.test_dispatch 3 2
+```
+
+软件测试不能代替现场试听。正式采集前必须做一段短录音，正常结束并逐个试听 `node1` 到 `node4`。
+
+## 本地 API
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `GET` | `/api/health` | 四麦、MQTT、机器人和实验状态 |
+| `GET` | `/api/get_meeting_data` | 发言时长、判定、干预和录音详情 |
+| `POST` | `/api/experiment/start` | 明确开始 |
+| `POST` | `/api/experiment/end` | 明确结束并传送 |
+| `POST` | `/api/experiment/retry-export` | 重试已完整录音的传送 |
+| `GET` | `/api/setup/networks` | 扫描 Wi-Fi |
+| `POST` | `/api/setup/provision` | 给机器人配置 Wi-Fi |
+
+开始请求示例：
 
 ```json
 {
   "output_dir": "D:\\EffMeet_Recordings",
-  "group_number": 2
+  "group_number": null,
+  "require_robot": true
 }
 ```
 
-`output_dir` 留空时使用默认路径；`group_number` 可为 `null`，表示按当天实验自动递增。开始接口只在 4 路麦克风、MQTT 和机器人全部就绪且机器人空闲时返回 `201`。
+正式现场优先使用 `.bat` 或网页控制台，不建议手写 API 请求绕过确认步骤。
 
-结束与重试接口不需要请求参数。结束成功后返回 `export.destination_dir`，并安排后台自动关闭；失败时返回当前 `recording.state` 和可读错误信息。
+## 常见问题
 
-`POST /api/session/reset` 仅为旧工具兼容保留。录音进行中会返回 `409`；正式实验请始终使用 `/api/experiment/start` 与 `/api/experiment/end`。
+### 改名后仍只显示 0/4 或 2/4 麦克风
 
-## 测试与联调
+1. 关闭 Windows 声音属性窗口。
+2. 确认四个名称精确为 `NODE1_MIC` 到 `NODE4_MIC`。
+3. 等待 5 秒。
+4. 结束未录音的旧后台并重新启动。
+5. 再运行 `check_mics.exe --verbose`。
 
-### 人声判定（robust）离线测试
+PortAudio 会缓存启动时的设备表；在后台运行期间改名，旧进程不一定立刻识别新名称。
 
-不需要真实麦克风、MQTT 或机器人，用合成音频离线验证"捂住麦克风不乱计"等行为：
+### 提示“四路录音均早于实验结束停止”
 
-```powershell
-cd cloud_brain
-python test_activity_engine.py
-```
+该组已经停止，但没有通过完整性检查。常见原因是 USB 集线器瞬断、供电不足、接头松动或录音进程异常。保留 `staging_dir`，检查日志和 WAV 时长，修复硬件后重新做短试录；不能把该组当成正式数据。
 
-该测试覆盖：捂住麦（只有短暂尖峰）不计时、串音不抢主导权、说话中短暂停顿不误停、
-主导者切换需持续证据。
+### `EffMeet.exe` 打不开
 
-### 分级干预行为测试
+- 必须完整解压 `EffMeet_App`，不能单独移动 EXE。
+- 路径中不能缺少 `_internal`。
+- 查看 `cloud_brain/data/logs/backend-*-error.log`。
+- 不要使用其他电脑打包进 ZIP 的 `.venv`。
 
-不需要真实 MQTT 或机器人：
+### MQTT 在线但机器人离线
 
-```powershell
-cd cloud_brain
-python test_intervention_expressions.py
-```
+确认电脑和机器人使用相同 Broker/Topic，机器人已连 2.4 GHz Wi-Fi，并检查网络是否允许 TCP 1883。给机器人重新上电后等待约 30 秒。
 
-该测试验证：
+### TFT 半屏、花屏或移动后不完整
 
-- 同一人的第 1 次干预使用提醒。
-- 同一人的第 2 次及以后使用好奇。
-- 未触发干预时发送稳定表情。
+先确认 `D7 → GPIO18`、`RST → GPIO42`、屏幕与电机共地。若问题只在电机启停时出现，重点检查屏幕供电压降、充电宝输出、接头松动和电机干扰抑制。软件会在电机停止后复位并重绘，但不能补偿持续掉电。
 
-### 录音与实验生命周期测试
+## 每组实验前后检查表
 
-不需要真实麦克风、MQTT 或机器人：
+开始前：
 
-```powershell
-cd cloud_brain
-python test_experiment_recording.py
-python test_experiment_lifecycle.py
-python test_session_management.py
-python test_device_setup.py
-```
+- [ ] 四只麦固定在 USB1–USB4，Windows 名称和座位一致。
+- [ ] `check_mics` 四路都有声音。
+- [ ] MQTT、机器人在线，机器人空闲。
+- [ ] TFT 完整显示专注表情。
+- [ ] 保存路径可写且空间足够。
+- [ ] 控制台仍为 `ready`，没有上组残留录音。
 
-这些测试验证 4 路 WAV 的声道数、位宽、采样率、帧数和命名；当天组号递增；会话/manifest 生成；大小与 SHA-256 校验；成功后删除暂存；开始失败可恢复；HTTP 开始→录音→结束→传送→自动关后台的完整状态流；以及设备向导恢复电脑网络且不保存 Wi-Fi 密码。
+结束后：
 
-### MQTT 调度链路测试
-
-```powershell
-cd cloud_brain
-python test_dispatch.py
-```
-
-可在 MQTTX 中同时订阅：
-
-```text
-esp32s3/control
-esp32s3/status
-effmeet/cycle/done
-```
-
-模拟机器人完成回包：
-
-```text
-向 esp32s3/status 发布：done|dir=2|target=3|expression=reminder
-```
-
-### 现场连续 5 轮稳定性验收
-
-烧录机器人、放到轨道起点并确认周围安全后运行：
-
-```powershell
-cd cloud_brain
-python test_hardware_stability.py
-```
-
-脚本先依次显示专注、提醒、好奇、稳定，每个表情都等待机器人返回带帧号的 `ack`；随后默认执行 `1 → 2 → 3 → 4 → 1` 共 5 次完整往返，并逐次核对 `done` 的目标和表情。结果保存到 `cloud_brain/data/hardware_tests/`。
-
-只检查 4 种表情、不移动机器人：
-
-```powershell
-python test_hardware_stability.py --expression-only
-```
-
-软件只能确认整帧绘制函数执行完毕和 MQTT 链路未断；正式验收仍需现场观察每次是否完整覆盖整块屏幕。
-
-### 其他测试
-
-- `test_activity_engine.py`：robust 人声判定（捂住麦/串音/静音容忍/切换确认）。
-- `test_local_mic.py`：本地麦克风和 VAD。
-- `test_multi_mic.py`：4 路麦克风输入与统计。
-- `test_meeting_logic.py`：会议状态和调度链路。
-- `test_intervention_expressions.py`：同一人的提醒/好奇升级与稳定表情。
-
-## 配置说明
-
-当前有两个云端入口：
-
-- `main_brain.py`：推荐入口，主要运行参数直接定义在文件顶部，并可用命令行参数覆盖检查间隔。
-- `main.py`：模块化入口，读取 `config.yaml`，内部使用 `MeetingState` 和 `MQTTManager`。
-
-`config.yaml` 中的 `intervention_interval` 和 `imbalance_ratio_threshold` 已用于模块化入口。`variance_threshold`、`cooldown_seconds` 和 `intervention_order` 当前属于预留配置，不会改变推荐入口 `main_brain.py` 的实际判定流程。
-
-## 注意事项
-
-- 机器人执行任务期间会持续维护 MQTT，但不会接受新的移动或表情指令；云端会等待 `done` 后再调度。
-- 干预次数按实验组保存在云端内存；明确开始新组时使用新的实验编号并归零，成功结束后后台自动关闭。
-- 机器人重启不会自动恢复云端的干预计数；表情等级始终由云端 payload 决定。
-- `expr:stable` 会自动恢复专注；直接发送 `expr:reminder` 或 `expr:curious` 不会自动恢复。
-- TFT 复位脚必须接 IO42，数据线 D7 必须接 GPIO18。若修复后仍在电机启停时出现花屏/半屏，需要检查屏幕和电机供电压降、共地、接头松动及电机端抑制干扰；软件会在电机停止后自动复位并重绘，但无法补偿持续的硬件掉电。
-- 首次运行 Faster-Whisper 和 Torch（仅源码模式且未加 `--no-whisper`）时可能需要下载模型缓存；打包 exe 已剥离这两者，无需下载。
-- 打包的 `EffMeet.exe` 默认不含语音转写（见"打包与分发"）；如需转写，请在装有 Python 与完整依赖的环境下源码运行 `python main_brain.py`。
-- 软件测试可验证 PCM 帧数、WAV 格式、文件哈希和接口状态，但不能代替现场的 4 个真实麦克风同步录音试听。正式采集前必须做一次短时硬件试录并逐个试听 `node1` 到 `node4`。
-- `cloud_brain/core/speaker_id.py` 和 `cloud_brain/logic/commander.py` 当前为预留模块。
-
-## 推荐启动顺序
-
-1. 烧录并启动 ESP32-S3 机器人，确认它已连接 Wi-Fi 和 MQTT。
-2. 给 4 路麦克风设置 `NODE1_MIC` 到 `NODE4_MIC`，运行 `python check_mics.py` 确认每路都"有声音"。
-3. 正式实验前运行 `python test_hardware_stability.py`，现场完成 4 种表情和连续 5 轮往返验收。
-4. 做一次短时 4 路硬件试录，结束后逐个试听 WAV，确认节点、座位、声道和音量对应正确。
-5. 正式组双击 `开始实验.bat`，确认目标路径和组号，输入 `START`。
-6. 浏览器明确显示“实验进行中 · 正在录音”后再宣布实验开始。
-7. 实验结束时双击 `结束实验.bat`，核对实验编号后输入 `END`。
-8. 只有看到“EXPERIMENT ENDED AND VERIFIED”且最终目录已打开，才记录本组完成；随后等待后台自动关闭。
-9. 下一组重复第 5–8 步，组号留空即可自动递增。
+- [ ] 输入 `END` 后看到 `EXPERIMENT ENDED AND VERIFIED`。
+- [ ] 最终目录自动打开。
+- [ ] 四个 WAV 都存在，时长接近。
+- [ ] `manifest.json` 与 `session.json` 存在。
+- [ ] 抽听四路，确认座位映射和音量正常。

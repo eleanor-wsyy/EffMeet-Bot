@@ -1,17 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
 # EffMeet 打包配置：PyInstaller --onedir，剥离 torch/whisper。
-# 产物：dist/EffMeet/EffMeet.exe（双击启动，等价 python main_brain.py --no-whisper --no-vad）
+# 从 cloud_brain 目录运行：
+#   python -m PyInstaller packaging/EffMeet.spec --noconfirm --clean
+# 产物：cloud_brain/dist/EffMeet/EffMeet.exe
 import os
 
 block_cipher = None
+source_root = os.path.abspath(os.path.join(SPECPATH, ".."))
+repo_root = os.path.abspath(os.path.join(source_root, ".."))
 
 a = Analysis(
-    ["main_brain.py"],
-    pathex=[],
+    [os.path.join(source_root, "main_brain.py")],
+    pathex=[source_root],
     binaries=[],
     datas=[
-        ("templates", "templates"),          # Flask 网页控制台
-        (os.path.join("..", "robot_esp32", "1.3", "png_to_h.py"), "firmware"),
+        (os.path.join(source_root, "templates"), "templates"),
+        (os.path.join(repo_root, "robot_esp32", "1.3", "png_to_h.py"), "firmware"),
     ],
     hiddenimports=[
         "sounddevice",
@@ -54,8 +58,8 @@ exe = EXE(
 
 # 麦克风自检工具 EXE：独立 Analysis（sounddevice/numpy 依赖同样被收集）。
 mic_a = Analysis(
-    ["check_mics.py"],
-    pathex=[],
+    [os.path.join(source_root, "tools", "check_mics.py")],
+    pathex=[source_root],
     binaries=[],
     datas=[],
     hiddenimports=["sounddevice", "numpy"],

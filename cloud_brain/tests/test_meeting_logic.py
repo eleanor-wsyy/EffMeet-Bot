@@ -3,6 +3,7 @@ import time
 import yaml
 import sys
 import io
+from pathlib import Path
 # 解决 Windows 终端中文/Emoji 乱码及编码错误
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
@@ -13,7 +14,8 @@ def run_test():
     print("=== [Test] 会议干预与MQTT下发闭环测试 ===")
     
     # 1. 加载配置
-    with open("config.yaml", 'r', encoding='utf-8') as f:
+    config_path = Path(__file__).resolve().parents[1] / "config.yaml"
+    with config_path.open('r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
         
     # 为了快速看效果，我们临时在内存里把“冷却时间”改成 0 秒
