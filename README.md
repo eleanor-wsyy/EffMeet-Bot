@@ -301,6 +301,7 @@ EffMeet-Bot/
 ├─ cloud_brain/
 │  ├─ main_brain.py                  # 当前推荐的云端主程序
 │  ├─ experiment_recording.py         # 4 路 WAV 暂存、封口、校验和传送
+│  ├─ windows_setup.py               # Windows Wi-Fi 扫描、切换、恢复与配网提交
 │  ├─ main.py                        # 模块化版本入口
 │  ├─ config.yaml                    # 模块化入口的 MQTT 和调度参数
 │  ├─ requirements.txt               # Python 依赖
@@ -325,6 +326,7 @@ EffMeet-Bot/
 │  ├─ test_hardware_stability.py      # 4 种表情 + 连续 5 次往返验收
 │  ├─ test_experiment_recording.py    # 录音格式、命名、校验和重试测试
 │  ├─ test_experiment_lifecycle.py    # HTTP 开始/结束/自动关后台测试
+│  ├─ test_device_setup.py           # 设备连接向导解析与恢复闭环测试
 │  └─ test_*.py                       # 其他联调和行为测试
 ├─ robot_esp32/
 │  └─ 1.3/
@@ -340,6 +342,7 @@ EffMeet-Bot/
 ├─ scripts/start_effmeet.ps1          # 启动或复用就绪后台
 ├─ scripts/begin_experiment.ps1       # 开始实验的确认与接口调用
 ├─ scripts/end_experiment.ps1         # 结束、校验、打开结果目录
+├─ scripts/build_firmware.ps1         # 固定英文缓存路径的单进程固件构建/烧录
 ├─ 开始实验.bat                       # 推荐的明确开始入口
 ├─ 结束实验.bat                       # 推荐的明确结束入口
 └─ README.md
@@ -418,6 +421,8 @@ TFT 使用整屏地址窗口连续写入 480×320 像素，不再逐像素重复
   浏览器开 <http://127.0.0.1:5000/> 使用。
 - `EffMeet_App/check_mics.exe` 是麦克风自检工具，双击即可确认 4 路 NODE*_MIC 是否连上、有声音。
 - 把整个 `EffMeet_App/` 目录拷贝到任意一台 Windows 电脑即可运行。
+- 控制台内置“设备连接向导”：换电脑或换场地 Wi-Fi 时直接在同一页面检查电脑网络、
+  MQTT、机器人和 4 路麦克风，并完成机器人配网；普通实验人员不需要安装 Arduino。
 
 也可从 GitHub Release 下载打包好的 zip：
 
@@ -504,9 +509,29 @@ python check_mics.py --verbose        # 额外打印所有输入设备
 输出会区分 ✅ 有声音 / ⚠️ 静音疑似无信号 / ❌ 未识别到。确认 4 路都 `✅` 即可。打包版
 双击 `check_mics.exe` 也能自检，无需装 Python。
 
-### 4. 配置并烧录机器人
+### 4. 首次开发：编译并烧录机器人（每台机器人只做一次）
 
-打开 `robot_esp32/1.3/1.3.ino`，确认：
+这一步只由开发人员执行。普通实验人员日常换电脑、换 Wi-Fi **不要重新烧录**。只有更换
+ESP32、清空整片闪存或以后升级固件时，才需要再次执行本节。
+
+稳定构建入口：
+
+```powershell
+# 只编译；固定使用 C:\EffMeetBuild\esp32s3，并复用持久缓存
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build_firmware.ps1
+
+# 首次开发烧录；多串口时必须明确指定，避免烧错设备
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build_firmware.ps1 -Upload -Port COM6
+```
+
+该入口使用命名互斥锁，确保同一时刻只有一个 `arduino-cli` 写构建目录；默认 4 个编译
+job。它不会修改全局安装的 GFX 1.5.0，而是在 `C:\EffMeetBuild\libraries` 生成不提交到
+仓库的最小临时副本，只编译本固件实际使用的 `Arduino_G`、`Arduino_GFX`、`Arduino_DataBus`、
+`Arduino_TFT`、`Arduino_SWPAR8` 和 `Arduino_ILI9488`。构建、烧录和重启串口日志均保存在
+`C:\EffMeetBuild\logs`。Windows 用户名含中文时，脚本会在构建期间自动映射一个空闲的英文
+盘符给 Arduino 数据目录，并在结束后解除。如确实需要完全重建才加 `-Clean`，日常不要清缓存或切换目录。
+
+固件仍位于 `robot_esp32/1.3/1.3.ino`，需确认：
 
 - WiFi 不再写死在代码中；首次烧录后通过配网热点填写 SSID 和密码。
 - MQTT Broker 和主题与云端一致。
@@ -517,16 +542,33 @@ python check_mics.py --verbose        # 额外打印所有输入设备
 
 烧录后通过串口确认 Wi-Fi、MQTT 和 TFT 初始化成功。
 
-#### WiFi 配网（只需烧录一次）
+#### 日常使用：在 EffMeet.exe 内换 Wi-Fi（不烧录）
 
-固件会把 WiFi 凭据保存到 ESP32 的 NVS 闪存中。以后更换 WiFi 或密码时不需要重新烧录：
+固件会把 Wi-Fi 凭据保存到 ESP32 的 NVS 闪存中。以后更换电脑、场地 Wi-Fi 或密码时：
+
+1. 双击 `EffMeet_App/EffMeet.exe`，打开 <http://127.0.0.1:5000/>。
+2. 查看“设备连接向导”。它会同时显示电脑联网、MQTT、机器人和 4 路麦克风状态。
+3. 机器人离线时，给机器人重新上电并等待约 30 秒；点击“扫描附近 Wi-Fi”，选择
+   `EffMeet-Setup-XXXX`，填写场地 Wi-Fi 名称和密码。
+4. 点击“连接机器人并自动恢复电脑网络”。程序会短暂连接机器人热点、调用固件现有
+   `/save` 写入 NVS、恢复电脑原网络，再等待 MQTT 和机器人上线。
+5. 所有检查通过后，“明确开始实验并录音”才可点击。
+
+密码只发送给本地机器人，不写入日志、仓库或控制台状态。必须注意：
+
+- ESP32 只支持 **2.4 GHz**；只发现 5/6 GHz 的网络会被向导拒绝。
+- 校园/企业账号认证、网页认证或证书网络不能只靠 SSID 和密码接入。
+- 电脑能上网不代表 MQTT 可用；校园网或防火墙封锁 TCP 1883 时，向导会明确报告
+  “电脑联网但 MQTT 不可用”。
+
+若自动向导因 Windows 无线网卡权限或驱动失败，仍可使用固件原生手动方式：
 
 1. 首次启动，或设备连接已保存的 WiFi 失败后，打开手机/电脑的 WiFi 列表。
 2. 连接设备发出的热点 `EffMeet-Setup-XXXX`，热点密码为 `EffMeet123`。
 3. 浏览器打开 <http://192.168.4.1/>，填写现场 WiFi 名称和密码，点击“保存并重启”。
 4. 设备重启后会自动连接新 WiFi，并在串口输出新的设备 IP。
 
-设备已经连上旧 WiFi 时，也可以直接访问串口输出的 `http://设备IP/` 修改 WiFi；页面的“清除已保存 WiFi”按钮会清除凭据并重启进入配网模式。保存的密码只写入设备本地，不会提交到 GitHub。
+设备已经连上旧 WiFi 时，也可以直接访问串口输出的 `http://设备IP/` 修改 WiFi；页面的“清除已保存 WiFi”按钮会清除凭据并重启进入配网模式。
 
 ### 5. 明确开始实验（推荐）
 
@@ -778,9 +820,10 @@ cd cloud_brain
 python test_experiment_recording.py
 python test_experiment_lifecycle.py
 python test_session_management.py
+python test_device_setup.py
 ```
 
-这些测试验证 4 路 WAV 的声道数、位宽、采样率、帧数和命名；当天组号递增；会话/manifest 生成；大小与 SHA-256 校验；成功后删除暂存；开始失败可恢复；HTTP 开始→录音→结束→传送→自动关后台的完整状态流。
+这些测试验证 4 路 WAV 的声道数、位宽、采样率、帧数和命名；当天组号递增；会话/manifest 生成；大小与 SHA-256 校验；成功后删除暂存；开始失败可恢复；HTTP 开始→录音→结束→传送→自动关后台的完整状态流；以及设备向导恢复电脑网络且不保存 Wi-Fi 密码。
 
 ### MQTT 调度链路测试
 

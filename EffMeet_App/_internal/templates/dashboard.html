@@ -45,12 +45,14 @@
     .metric span { display: block; color: #748094; font-size: 13px; margin-bottom: 6px; }
     .metric strong { display: block; font-size: 18px; overflow-wrap: anywhere; }
     .node strong { font-size: 24px; }
+    .node.offline { background: #fff1f0; border: 1px solid #f3b5ae; }
+    .node.offline strong { color: #b42318; }
     .ok { color: #16794b; }
     .warn { color: #b25700; }
     .bad { color: #b42318; }
     .form-grid { display: grid; grid-template-columns: 1fr 180px; gap: 14px; }
     label { display: block; color: #4f5c6e; font-size: 14px; font-weight: 700; }
-    input {
+    input, select {
       width: 100%;
       margin-top: 7px;
       padding: 12px;
@@ -59,6 +61,23 @@
       font: inherit;
     }
     .hint { margin: 12px 0 0; color: #637083; font-size: 13px; line-height: 1.55; }
+    .readiness { display: grid; gap: 8px; margin-top: 16px; }
+    .readiness-item { padding: 10px 12px; border-radius: 9px; background: #edf8f2; color: #16794b; font-size: 14px; }
+    .readiness-item.bad { background: #fff1f0; color: #b42318; }
+    .readiness-item.warn { background: #fff7ed; color: #9a4d00; }
+    .degraded-mode { margin-top: 14px; padding: 12px; border: 1px solid #e0e5eb; border-radius: 10px; background: #f7f8fa; }
+    .no-robot-label { display: flex; align-items: center; gap: 8px; font-weight: 700; cursor: pointer; }
+    .no-robot-label input { width: auto; margin: 0; padding: 0; accent-color: #1769e0; }
+    .degraded-mode .hint { margin-top: 6px; }
+    .setup-checks { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 16px; }
+    .setup-check { padding: 12px; border-radius: 10px; background: #fff1f0; color: #b42318; font-weight: 800; }
+    .setup-check.ok { background: #edf8f2; color: #16794b; }
+    .setup-tools { margin-top: 16px; padding-top: 16px; border-top: 1px solid #e0e5eb; }
+    .setup-warning { padding: 12px; border-radius: 10px; background: #fff7ed; color: #8a4600; line-height: 1.55; }
+    .setup-form { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
+    .setup-progress { margin-top: 14px; padding: 12px; border-radius: 10px; background: #eef4ff; color: #174ea6; font-weight: 700; line-height: 1.55; }
+    .secondary { background: #596579; }
+    .secondary:hover { background: #465164; }
     .actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 18px; }
     button {
       min-width: 220px;
@@ -76,13 +95,20 @@
     .end { background: #d92d20; }
     .end:hover { background: #b42318; }
     .retry { background: #b25700; }
+    details.panel > summary { cursor: pointer; color: #4f5c6e; font-weight: 800; }
+    .developer-body { margin-top: 18px; }
     #message { min-height: 26px; margin: 12px 2px; font-weight: 700; overflow-wrap: anywhere; }
     .destination { margin-top: 12px; padding: 12px; background: #edf8f2; border-radius: 9px; overflow-wrap: anywhere; }
     [hidden] { display: none !important; }
     @media (max-width: 780px) {
-      .status-grid, .nodes, .form-grid { grid-template-columns: repeat(2, 1fr); }
+      .status-grid, .nodes { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .form-grid, .setup-form { grid-template-columns: 1fr; }
+      .setup-checks { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .phase { align-items: flex-start; flex-direction: column; }
-      button { width: 100%; }
+      .actions { flex-wrap: wrap; justify-content: stretch; }
+      .actions button { min-width: 0; width: 100%; }
+      .expression-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .expression-actions button { width: auto; }
     }
   </style>
 </head>
@@ -109,6 +135,37 @@
       <div class="nodes" id="nodes"></div>
     </section>
 
+    <section class="panel" id="device-setup-panel">
+      <h3>设备连接向导</h3>
+      <p class="hint">日常换电脑或换 Wi-Fi 只在这里操作，不需要 Arduino，也不需要重新烧录机器人。</p>
+      <div class="setup-checks" id="setup-checks" aria-live="polite"></div>
+      <div class="setup-tools" id="setup-tools" hidden>
+        <div class="setup-warning">
+          <strong>开始前确认：</strong>ESP32 只支持 2.4 GHz。校园认证网、网页登录网、企业账号网不能只靠名称和密码接入；即使电脑能上网，学校或防火墙限制 MQTT 端口 1883 时机器人仍会离线。
+        </div>
+        <div class="setup-form">
+          <label>
+            机器人配网热点
+            <select id="setup-ssid"><option value="">点击“扫描附近 Wi-Fi”</option></select>
+          </label>
+          <label>
+            场地 Wi-Fi 名称（必须有 2.4 GHz）
+            <input id="target-ssid" type="text" maxlength="32" list="target-networks" autocomplete="off">
+            <datalist id="target-networks"></datalist>
+          </label>
+          <label>
+            场地 Wi-Fi 密码
+            <input id="target-password" type="password" maxlength="63" autocomplete="new-password">
+          </label>
+        </div>
+        <div class="actions">
+          <button class="secondary" id="setup-scan" type="button">扫描附近 Wi-Fi</button>
+          <button class="start" id="setup-start" type="button">连接机器人并自动恢复电脑网络</button>
+        </div>
+      </div>
+      <div class="setup-progress" id="setup-progress" role="status" aria-live="polite"></div>
+    </section>
+
     <section class="panel" id="start-panel">
       <div class="form-grid">
         <label>
@@ -121,11 +178,15 @@
         </label>
       </div>
       <p class="hint">正式目录命名：<code>YYYYMMDD_HHMMSS_groupNNN</code>。其中包含 node1–node4 四个 WAV、会话 JSON 和带 SHA-256 的 manifest。目标路径可直接填写移动硬盘或网络盘的绝对路径。</p>
-      <div class="actions">
+      <div class="readiness" id="readiness" role="status" aria-live="polite"></div>
+      <div class="degraded-mode">
         <label class="no-robot-label" title="勾选后即使机器人未连接也能开始录音，适合先测麦克风">
           <input id="no-robot" type="checkbox">
-          机器人未连接（仅测麦克风/录音）
+          <span>仅测麦克风（跳过 MQTT 和机器人校验）</span>
         </label>
+        <p class="hint">只用于单独测试四路录音；正式实验请不要勾选。</p>
+      </div>
+      <div class="actions start-actions">
         <button class="start" id="start" type="button">明确开始实验并录音</button>
       </div>
     </section>
@@ -133,7 +194,7 @@
     <section class="panel" id="expr-panel">
       <h3>手动表情</h3>
       <p class="hint">将 `expr:<名称>` 直接下发给机器人（仅改变 TFT 显示，不移动小车，不影响干预计数）。</p>
-      <div class="actions">
+      <div class="actions expression-actions">
         <button class="start" data-expr="focus" type="button">专注 focus</button>
         <button class="start" data-expr="reminder" type="button">提醒 reminder</button>
         <button class="start" data-expr="curious" type="button">好奇 curious</button>
@@ -142,29 +203,31 @@
       <p id="expr-result" class="hint"></p>
     </section>
 
-    <section class="panel">
-      <h3>上传表情图片</h3>
-      <p class="hint">上传一张 480x320 的黑白(1-bit) PNG，自动转成机器人固件的 .h 位图，覆盖所选槽位（原 4 个表情保留，测试时可选其它槽位）。上传后需重新编译烧录固件才生效。</p>
-      <div class="form-grid">
-        <label>
-          表情图片（PNG, 480x320）
-          <input id="expr-file" type="file" accept="image/png">
-        </label>
-        <label>
-          覆盖槽位
-          <select id="expr-slot">
-            <option value="focus">focus（专注, image_array.h）</option>
-            <option value="reminder">reminder（提醒, reminder_image.h）</option>
-            <option value="curious">curious（好奇, curious_image.h）</option>
-            <option value="stable">stable（稳定, stable_image.h）</option>
-          </select>
-        </label>
+    <details class="panel">
+      <summary>开发者选项 · 上传表情图片（需重新编译烧录固件）</summary>
+      <div class="developer-body">
+        <p class="hint">上传一张 480x320 的黑白(1-bit) PNG，自动转成机器人固件的 .h 位图，覆盖所选槽位（原 4 个表情保留，测试时可选其它槽位）。上传后需重新编译烧录固件才生效。</p>
+        <div class="form-grid">
+          <label>
+            表情图片（PNG, 480x320）
+            <input id="expr-file" type="file" accept="image/png">
+          </label>
+          <label>
+            覆盖槽位
+            <select id="expr-slot">
+              <option value="focus">focus（专注, image_array.h）</option>
+              <option value="reminder">reminder（提醒, reminder_image.h）</option>
+              <option value="curious">curious（好奇, curious_image.h）</option>
+              <option value="stable">stable（稳定, stable_image.h）</option>
+            </select>
+          </label>
+        </div>
+        <div class="actions">
+          <button class="start" id="expr-upload" type="button">上传并转码</button>
+        </div>
+        <p id="expr-upload-result" class="hint"></p>
       </div>
-      <div class="actions">
-        <button class="start" id="expr-upload" type="button">上传并转码</button>
-      </div>
-      <p id="expr-upload-result" class="hint"></p>
-    </section>
+    </details>
 
     <section class="panel" id="end-panel" hidden>
       <p>点击结束后，系统立即停止四路采集，完整封口 WAV，等待最后转写，传送并逐文件校验。全部成功后后台自动退出。</p>
@@ -201,6 +264,16 @@
       robot: document.querySelector('#robot'),
       experimentId: document.querySelector('#experiment-id'),
       nodes: document.querySelector('#nodes'),
+      readiness: document.querySelector('#readiness'),
+      setupChecks: document.querySelector('#setup-checks'),
+      setupTools: document.querySelector('#setup-tools'),
+      setupProgress: document.querySelector('#setup-progress'),
+      setupSsid: document.querySelector('#setup-ssid'),
+      setupScan: document.querySelector('#setup-scan'),
+      setupStart: document.querySelector('#setup-start'),
+      targetSsid: document.querySelector('#target-ssid'),
+      targetPassword: document.querySelector('#target-password'),
+      targetNetworks: document.querySelector('#target-networks'),
       outputDir: document.querySelector('#output-dir'),
       groupNumber: document.querySelector('#group-number'),
       startPanel: document.querySelector('#start-panel'),
@@ -222,6 +295,7 @@
       exprUploadResult: document.querySelector('#expr-upload-result'),
     };
     let latest = null;
+    let latestSetup = null;
     let shutdownExpected = false;
     let outputInitialized = false;
 
@@ -242,7 +316,11 @@
       latest = data;
       const recording = data.experiment || {};
       const state = recording.state || 'ready';
-      const microphonesReady = (data.microphones || []).length === 4;
+      const expectedNodes = ['node1', 'node2', 'node3', 'node4'];
+      const onlineNodes = new Set(data.microphones || []);
+      const missingNodes = expectedNodes.filter(node => !onlineNodes.has(node));
+      const microphonesReady = missingNodes.length === 0;
+      const microphoneScanFailed = Boolean((data.audio_capture || {}).scan_error);
 
       if (!outputInitialized) {
         elements.outputDir.value = data.default_output_dir || '';
@@ -253,7 +331,7 @@
       setStatus(elements.mqtt, data.mqtt_connected ? '已连接' : '未连接', data.mqtt_connected ? 'ok' : 'bad');
       setStatus(elements.robot, !data.robot_online ? '设备离线' : (data.robot_busy ? '执行任务中' : '在线 · 空闲'), !data.robot_online ? 'bad' : (data.robot_busy ? 'warn' : 'ok'));
       elements.experimentId.textContent = recording.experiment_id || '尚未生成';
-      elements.elapsed.textContent = duration(recording.elapsed_seconds);
+      elements.elapsed.textContent = recording.started_at ? duration(recording.elapsed_seconds) : '—';
 
       const times = data.current_speaking_times || {};
       const counts = data.intervention_counts || {};
@@ -261,7 +339,8 @@
       elements.nodes.innerHTML = [1, 2, 3, 4].map(number => {
         const key = `node${number}`;
         const recorded = Number(frames[key] || 0) / 16000;
-        return `<div class="metric node"><span>${key} · 发言 ${Number(times[key] || 0).toFixed(1)}s · 干预 ${Number(counts[key] || 0)} 次</span><strong>录音 ${recorded.toFixed(1)}s</strong></div>`;
+        const online = onlineNodes.has(key);
+        return `<div class="metric node${online ? '' : ' offline'}"><span>${key} · ${online ? '在线' : '离线'} · 发言 ${Number(times[key] || 0).toFixed(1)}s · 干预 ${Number(counts[key] || 0)} 次</span><strong>${online ? `录音 ${recorded.toFixed(1)}s` : '未检测到设备'}</strong></div>`;
       }).join('');
 
       const recordingNow = state === 'recording';
@@ -275,14 +354,38 @@
       elements.stagingDirectory.textContent = `本机暂存目录：${recording.staging_dir || '未取得路径，请查看后台日志'}`;
 
       const noRobot = elements.noRobot.checked;
+      const checks = [
+        microphoneScanFailed
+          ? { state: 'bad', text: '✕ 无法扫描 Windows 录音设备；请重新插拔 USB 麦克风并重启后台' }
+          : microphonesReady
+          ? { state: 'ok', text: '✓ 四路麦克风已就绪' }
+          : { state: 'bad', text: `✕ 缺少 ${missingNodes.join('、')}；检查 USB，并确认 Windows 设备名为 NODE1_MIC–NODE4_MIC` },
+        noRobot
+          ? { state: 'warn', text: '— 仅测麦克风模式：已跳过 MQTT 与机器人校验' }
+          : (data.mqtt_connected
+            ? { state: 'ok', text: '✓ 云端 MQTT 已连接' }
+            : { state: 'bad', text: '✕ 云端 MQTT 未连接；检查本机网络' }),
+        noRobot
+          ? null
+          : (!data.robot_online
+            ? { state: 'bad', text: '✕ 机器人离线；检查机器人供电和 Wi-Fi，或仅在录音测试时勾选“仅测麦克风”' }
+            : (data.robot_busy
+              ? { state: 'bad', text: '✕ 机器人正在执行任务；请等待任务完成' }
+              : { state: 'ok', text: '✓ 机器人在线且空闲' })),
+      ].filter(Boolean);
+      elements.readiness.innerHTML = checks.map(check => `<div class="readiness-item ${check.state}">${check.text}</div>`).join('');
       const baseReady = microphonesReady && state === 'ready';
       const fullReady = baseReady && data.mqtt_connected && data.robot_online && !data.robot_busy;
       const ready = noRobot ? baseReady : fullReady;
       elements.start.disabled = !ready;
-      elements.start.title = ready ? '' : (noRobot ? '需 4 路麦克风就绪' : '必须满足：4 路麦克风、MQTT、机器人全部就绪且机器人空闲');
+      elements.start.title = ready ? '' : '请先处理上方红色未通过项';
 
-      elements.phasePanel.className = `panel phase ${recordingNow ? 'recording' : (finished ? 'done' : (fatalError ? 'error' : 'ready'))}`;
-      if (recordingNow) {
+      const liveAudioFailure = recordingNow && !microphonesReady;
+      elements.phasePanel.className = `panel phase ${liveAudioFailure || fatalError ? 'error' : (recordingNow ? 'recording' : (finished ? 'done' : 'ready'))}`;
+      if (liveAudioFailure) {
+        elements.phaseTitle.textContent = '严重告警 · 四路录音不完整';
+        elements.phaseDetail.textContent = `未持续收到 ${missingNodes.join('、')} 的音频。请立即检查 USB；结束时系统会拒绝把残缺录音标记为完整。`;
+      } else if (recordingNow) {
         elements.phaseTitle.textContent = '实验进行中 · 正在录音';
         elements.phaseDetail.textContent = `开始时间：${recording.started_at || '—'}；结束前请勿关闭页面或后台。`;
       } else if (finished) {
@@ -312,6 +415,55 @@
         if (shutdownExpected) return;
         elements.message.textContent = `后台连接失败：${error.message}`;
         elements.message.className = 'bad';
+      }
+    }
+
+    function renderSetup(data) {
+      latestSetup = data;
+      const microphones = data.microphones || [];
+      const computer = data.computer || {};
+      const provisioning = data.provisioning || {};
+      const running = ['starting', 'connecting_setup', 'sending_credentials', 'restoring_network', 'waiting_online'].includes(provisioning.state);
+      const checks = [
+        { ok: computer.internet_available, text: computer.internet_available ? '电脑联网正常' : '电脑无法访问 MQTT 网络' },
+        { ok: data.mqtt_connected, text: data.mqtt_connected ? '云端 MQTT 已连接' : '云端 MQTT 未连接' },
+        { ok: data.robot_online, text: data.robot_online ? '机器人在线' : '机器人离线' },
+        { ok: microphones.length === 4, text: `麦克风 ${microphones.length}/4` },
+      ];
+      elements.setupChecks.innerHTML = checks.map(check => `<div class="setup-check${check.ok ? ' ok' : ''}">${check.ok ? '✓' : '✕'} ${check.text}</div>`).join('');
+      elements.setupTools.hidden = data.robot_online && !running && provisioning.state !== 'error';
+      elements.setupScan.disabled = running;
+      elements.setupStart.disabled = running;
+
+      if (!data.platform_supported) {
+        elements.setupProgress.textContent = '自动设备连接向导仅支持 Windows。';
+        elements.setupProgress.className = 'setup-progress bad';
+      } else if (running) {
+        elements.setupProgress.textContent = `${provisioning.step}：${provisioning.message} 请勿关闭后台或手动切换 Wi-Fi。`;
+        elements.setupProgress.className = 'setup-progress warn';
+      } else if (provisioning.state === 'success') {
+        elements.setupProgress.textContent = `✓ ${provisioning.message}`;
+        elements.setupProgress.className = 'setup-progress ok';
+      } else if (provisioning.state === 'error') {
+        elements.setupProgress.textContent = `连接失败：${provisioning.error}`;
+        elements.setupProgress.className = 'setup-progress bad';
+      } else if (data.robot_online) {
+        elements.setupProgress.textContent = `机器人已在线，无需配网。电脑当前网络：${computer.wifi_ssid || '非 Wi-Fi/未识别'}。`;
+        elements.setupProgress.className = 'setup-progress ok';
+      } else {
+        elements.setupProgress.textContent = '机器人离线：给机器人上电并等待约 30 秒出现 EffMeet-Setup-XXXX，然后扫描并填写场地 Wi-Fi。';
+        elements.setupProgress.className = 'setup-progress warn';
+      }
+    }
+
+    async function refreshSetup() {
+      try {
+        const response = await fetch('/api/setup/status', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        renderSetup(await response.json());
+      } catch (error) {
+        elements.setupProgress.textContent = `设备检查失败：${error.message}`;
+        elements.setupProgress.className = 'setup-progress bad';
       }
     }
 
@@ -353,6 +505,85 @@
         elements.message.textContent = error.message;
         elements.message.className = 'bad';
         await refresh();
+      }
+    });
+
+    elements.noRobot.addEventListener('change', () => {
+      if (latest) render(latest);
+    });
+
+    elements.setupScan.addEventListener('click', async () => {
+      elements.setupScan.disabled = true;
+      elements.setupProgress.textContent = '正在扫描附近 Wi-Fi…';
+      elements.setupProgress.className = 'setup-progress warn';
+      try {
+        const response = await fetch('/api/setup/networks', { cache: 'no-store' });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.message || `HTTP ${response.status}`);
+        const setupHotspots = result.setup_hotspots || [];
+        elements.setupSsid.replaceChildren();
+        if (setupHotspots.length) {
+          setupHotspots.forEach(item => {
+            const option = document.createElement('option');
+            option.value = item.ssid;
+            option.textContent = item.ssid;
+            elements.setupSsid.append(option);
+          });
+        } else {
+          const option = document.createElement('option');
+          option.value = '';
+          option.textContent = '未找到 EffMeet-Setup-XXXX';
+          elements.setupSsid.append(option);
+        }
+        const venueNetworks = (result.networks || []).filter(item => !item.ssid.startsWith('EffMeet-Setup-'));
+        elements.targetNetworks.replaceChildren();
+        venueNetworks.forEach(item => {
+          const option = document.createElement('option');
+          option.value = item.ssid;
+          option.label = `${item.bands.join(' / ')} · ${item.authentication}`;
+          elements.targetNetworks.append(option);
+        });
+        if (!elements.targetSsid.value && result.current_wifi && result.current_wifi.ssid) {
+          elements.targetSsid.value = result.current_wifi.ssid;
+        }
+        elements.setupProgress.textContent = setupHotspots.length
+          ? `发现 ${setupHotspots.length} 个机器人配网热点。请选择后开始连接。`
+          : '未发现机器人热点。请给机器人重新上电，等待约 30 秒后再扫描。';
+        elements.setupProgress.className = setupHotspots.length ? 'setup-progress ok' : 'setup-progress warn';
+      } catch (error) {
+        elements.setupProgress.textContent = `扫描失败：${error.message}`;
+        elements.setupProgress.className = 'setup-progress bad';
+      } finally {
+        elements.setupScan.disabled = false;
+      }
+    });
+
+    elements.setupStart.addEventListener('click', async () => {
+      const setupSsid = elements.setupSsid.value.trim();
+      const targetSsid = elements.targetSsid.value.trim();
+      const password = elements.targetPassword.value;
+      if (!setupSsid || !targetSsid) {
+        elements.setupProgress.textContent = '必须选择机器人配网热点，并填写场地 Wi-Fi 名称。';
+        elements.setupProgress.className = 'setup-progress bad';
+        return;
+      }
+      const confirmed = window.confirm(`确认把机器人连接到“${targetSsid}”吗？\n\n电脑会短暂连接 ${setupSsid}，写入后自动恢复原网络。`);
+      if (!confirmed) return;
+      elements.setupStart.disabled = true;
+      try {
+        const result = await post('/api/setup/provision', {
+          setup_ssid: setupSsid,
+          target_ssid: targetSsid,
+          password,
+        });
+        elements.targetPassword.value = '';
+        elements.setupProgress.textContent = result.message;
+        elements.setupProgress.className = 'setup-progress warn';
+        await refreshSetup();
+      } catch (error) {
+        elements.setupProgress.textContent = `无法开始连接：${error.message}`;
+        elements.setupProgress.className = 'setup-progress bad';
+        elements.setupStart.disabled = false;
       }
     });
 
@@ -451,7 +682,9 @@
     });
 
     refresh();
+    refreshSetup();
     setInterval(refresh, 1000);
+    setInterval(refreshSetup, 3000);
   </script>
 </body>
 </html>

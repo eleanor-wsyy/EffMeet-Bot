@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import tempfile
 import threading
+import time
 import wave
 from pathlib import Path
 
@@ -19,6 +20,7 @@ def test_http_start_end_export_shutdown_lifecycle():
             "microphones": brain._microphones,
             "no_mic": brain._no_mic_mode,
             "start_audio": brain.start_audio_capture,
+            "refresh_microphones": brain.refresh_microphones,
             "stop_audio": brain.stop_audio_capture,
             "flush_audio": brain.flush_audio_processing,
             "schedule_shutdown": brain.schedule_backend_shutdown,
@@ -35,6 +37,7 @@ def test_http_start_end_export_shutdown_lifecycle():
             brain._mqtt_connected.set()
             brain._robot_online.set()
             brain.start_audio_capture = lambda: None
+            brain.refresh_microphones = lambda force=False: dict(brain._microphones)
             brain.stop_audio_capture = lambda: None
             def assert_flush_while_analysis_active(timeout=30):
                 assert brain._experiment_active.is_set()
@@ -84,6 +87,7 @@ def test_http_start_end_export_shutdown_lifecycle():
             brain._microphones = original["microphones"]
             brain._no_mic_mode = original["no_mic"]
             brain.start_audio_capture = original["start_audio"]
+            brain.refresh_microphones = original["refresh_microphones"]
             brain.stop_audio_capture = original["stop_audio"]
             brain.flush_audio_processing = original["flush_audio"]
             brain.schedule_backend_shutdown = original["schedule_shutdown"]
@@ -108,6 +112,7 @@ def test_http_failed_audio_start_is_retryable():
             "microphones": brain._microphones,
             "no_mic": brain._no_mic_mode,
             "start_audio": brain.start_audio_capture,
+            "refresh_microphones": brain.refresh_microphones,
             "stop_audio": brain.stop_audio_capture,
             "mqtt": brain._mqtt_connected.is_set(),
             "robot": brain._robot_online.is_set(),
@@ -120,6 +125,7 @@ def test_http_failed_audio_start_is_retryable():
             brain._mqtt_connected.set()
             brain._robot_online.set()
             brain.stop_audio_capture = lambda: None
+            brain.refresh_microphones = lambda force=False: dict(brain._microphones)
 
             def fail_audio_start():
                 brain.experiment_recorder.capture("node1", b"\x00\x00" * 16)
@@ -152,6 +158,7 @@ def test_http_failed_audio_start_is_retryable():
             brain._microphones = original["microphones"]
             brain._no_mic_mode = original["no_mic"]
             brain.start_audio_capture = original["start_audio"]
+            brain.refresh_microphones = original["refresh_microphones"]
             brain.stop_audio_capture = original["stop_audio"]
             brain._experiment_active.clear()
             brain._experiment_ending.clear()
@@ -200,9 +207,48 @@ def test_overlapping_lifecycle_request_is_rejected():
         brain._experiment_api_lock.release()
 
 
+def test_live_microphone_status_uses_callback_liveness():
+    original_active = brain._experiment_active.is_set()
+    with brain._audio_health_lock:
+        original_last_chunks = dict(brain._audio_last_chunk_monotonic)
+        original_errors = dict(brain._audio_callback_errors)
+        brain._audio_last_chunk_monotonic = {
+            "node1": time.monotonic(),
+            "node2": time.monotonic() - brain.AUDIO_CALLBACK_TIMEOUT_SECONDS - 1,
+        }
+        brain._audio_callback_errors = {}
+    brain._experiment_active.set()
+    try:
+        status = brain.current_microphone_status()
+        assert status["online_nodes"] == ["node1"]
+        assert status["missing_nodes"] == ["node2", "node3", "node4"]
+    finally:
+        with brain._audio_health_lock:
+            brain._audio_last_chunk_monotonic = original_last_chunks
+            brain._audio_callback_errors = original_errors
+        if not original_active:
+            brain._experiment_active.clear()
+
+
+def test_start_rejects_fresh_scan_with_missing_microphone():
+    original_refresh = brain.refresh_microphones
+    original_no_mic = brain._no_mic_mode
+    brain.refresh_microphones = lambda force=False: {node: index for index, node in enumerate(NODES[:3])}
+    brain._no_mic_mode = False
+    try:
+        response = brain.app.test_client().post("/api/experiment/start", json={})
+        assert response.status_code == 409
+        assert "3 路麦克风" in response.get_json()["message"]
+    finally:
+        brain.refresh_microphones = original_refresh
+        brain._no_mic_mode = original_no_mic
+
+
 if __name__ == "__main__":
     test_http_start_end_export_shutdown_lifecycle()
     test_http_failed_audio_start_is_retryable()
     test_flush_discards_only_unmatched_analysis_tail()
     test_overlapping_lifecycle_request_is_rejected()
+    test_live_microphone_status_uses_callback_liveness()
+    test_start_rejects_fresh_scan_with_missing_microphone()
     print("Experiment HTTP lifecycle test passed.")

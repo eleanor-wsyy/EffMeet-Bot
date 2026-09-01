@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from experiment_recording import ExperimentRecorder
+from experiment_recording import ExperimentRecorder, RecordingError
 
 
 NODES = ["node1", "node2", "node3", "node4"]
@@ -156,10 +156,46 @@ def test_verified_export_survives_staging_cleanup_failure():
         assert recorder.status()["state"] == "exported"
 
 
+def test_missing_microphone_audio_is_rejected():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        recorder = ExperimentRecorder(Path(temp_dir) / "staging")
+        recorder.start(output_dir=Path(temp_dir) / "destination", nodes=NODES)
+        audio = b"\x12\x34" * (16000 * 3)
+        for node in NODES[:-1]:
+            recorder.capture(node, audio)
+
+        try:
+            recorder.stop()
+        except RecordingError as exc:
+            assert "node4" in str(exc)
+            assert recorder.status()["state"] == "error"
+        else:
+            raise AssertionError("missing microphone audio was accepted")
+
+
+def test_long_digital_silence_is_rejected():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        recorder = ExperimentRecorder(Path(temp_dir) / "staging")
+        recorder.start(output_dir=Path(temp_dir) / "destination", nodes=NODES)
+        silence = b"\x00\x00" * (16000 * 10)
+        for node in NODES:
+            recorder.capture(node, silence)
+
+        try:
+            recorder.stop()
+        except RecordingError as exc:
+            assert "数字静音" in str(exc)
+            assert recorder.status()["state"] == "error"
+        else:
+            raise AssertionError("long digital silence was accepted")
+
+
 if __name__ == "__main__":
     test_precise_recording_export()
     test_daily_group_auto_increment()
     test_failed_start_can_return_to_ready()
     test_closed_recording_can_be_deferred_and_retried()
     test_verified_export_survives_staging_cleanup_failure()
+    test_missing_microphone_audio_is_rejected()
+    test_long_digital_silence_is_rejected()
     print("Experiment recording/export tests passed.")

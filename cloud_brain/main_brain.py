@@ -23,6 +23,7 @@ from flask import Flask, jsonify, render_template, request
 from core.activity_engine import ActivityEngine
 from core.vad_engine import VADEngine
 from experiment_recording import ExperimentRecorder, RecordingError
+import windows_setup
 
 
 # 统一控制台编码，避免 Windows 双击运行时中文日志乱码。
@@ -54,6 +55,9 @@ if hasattr(sys.stderr, "buffer") and (sys.stderr.encoding or "").lower() != "utf
 # 基础音频参数。
 SAMPLE_RATE = 16000
 CHUNK_DURATION = 0.5
+MICROPHONE_SCAN_INTERVAL_SECONDS = 5.0
+AUDIO_CALLBACK_TIMEOUT_SECONDS = 2.0
+AUDIO_START_TIMEOUT_SECONDS = 2.0
 CALIBRATION_SECONDS = 3.0
 ABSOLUTE_DB_FLOOR = 45.0
 SPEECH_ABOVE_NOISE_DB = 10.0
@@ -147,11 +151,35 @@ _brain_flushed = threading.Event()
 _stream_lock = threading.Lock()
 _audio_streams = []
 _microphones = {}
+_microphone_lock = threading.Lock()
+_last_microphone_scan_monotonic = 0.0
+_microphone_scan_error = ""
+_audio_health_lock = threading.Lock()
+_audio_last_chunk_monotonic = {}
+_audio_callback_errors = {}
 _audio_workers_started = False
 _no_mic_mode = False
 _no_robot_mode = False
 _pending_session_snapshot = None
 _experiment_api_lock = threading.Lock()
+
+# Windows 设备连接向导。Wi-Fi 密码只存在于单次后台线程参数中，不写日志或状态。
+_setup_state_lock = threading.Lock()
+_setup_thread = None
+_setup_state = {
+    "state": "idle",
+    "step": "等待检查",
+    "message": "",
+    "error": "",
+    "setup_ssid": "",
+    "target_ssid": "",
+    "original_ssid": "",
+    "current_ssid": "",
+    "started_at": "",
+    "completed_at": "",
+}
+_connectivity_lock = threading.Lock()
+_connectivity_cache = {"checked_at": 0.0, "wifi": {}, "internet_available": False, "error": ""}
 
 
 def parse_args(argv):
@@ -354,6 +382,130 @@ def serialize_experiment_api(function):
     return wrapped
 
 
+def _update_setup_state(**updates):
+    with _setup_state_lock:
+        _setup_state.update(updates)
+        return dict(_setup_state)
+
+
+def _setup_state_snapshot():
+    with _setup_state_lock:
+        return dict(_setup_state)
+
+
+def _connectivity_snapshot(force=False):
+    now = time.monotonic()
+    with _connectivity_lock:
+        if not force and now - _connectivity_cache["checked_at"] < 3.0:
+            return dict(_connectivity_cache)
+        try:
+            wifi = windows_setup.connected_wifi()
+            error = ""
+        except windows_setup.SetupError as exc:
+            wifi = {}
+            error = str(exc)
+        internet = windows_setup.internet_available(timeout=2)
+        _connectivity_cache.update(
+            checked_at=now,
+            wifi=wifi,
+            internet_available=internet,
+            error=error,
+        )
+        return dict(_connectivity_cache)
+
+
+def _restore_after_setup(original, setup_ssid):
+    restored = windows_setup.restore_original_wifi(original)
+    windows_setup.remove_setup_profile(setup_ssid, original.get("name", ""))
+    _connectivity_snapshot(force=True)
+    return restored
+
+
+def _provision_robot_wifi(setup_ssid, target_ssid, password):
+    original = {}
+    setup_connected = False
+    restored = False
+    try:
+        original = windows_setup.connected_wifi()
+        if not original.get("name"):
+            raise windows_setup.SetupError("没有找到可用的 Windows Wi-Fi 网卡。")
+        _update_setup_state(
+            state="connecting_setup",
+            step="1/4 连接机器人配网热点",
+            message=f"正在连接 {setup_ssid}…",
+            original_ssid=original.get("ssid", ""),
+            current_ssid=original.get("ssid", ""),
+        )
+        connected = windows_setup.connect_setup_hotspot(setup_ssid, original["name"])
+        setup_connected = True
+        _update_setup_state(
+            state="sending_credentials",
+            step="2/4 写入场地 Wi-Fi",
+            message="已连接机器人；正在安全地把本次输入写入 ESP32 本地闪存…",
+            current_ssid=connected.get("ssid", setup_ssid),
+        )
+        _robot_online.clear()
+        windows_setup.send_wifi_credentials(target_ssid, password)
+        time.sleep(2)
+
+        _update_setup_state(
+            state="restoring_network",
+            step="3/4 恢复电脑原网络",
+            message=f"机器人正在重启；正在恢复 {original.get('ssid') or '电脑原网络状态'}…",
+        )
+        restored_wifi = _restore_after_setup(original, setup_ssid)
+        restored = True
+        setup_connected = False
+        _update_setup_state(
+            state="waiting_online",
+            step="4/4 等待 MQTT 和机器人上线",
+            message="电脑网络已恢复；正在等待云端 MQTT 与机器人重新上线…",
+            current_ssid=restored_wifi.get("ssid", ""),
+        )
+
+        deadline = time.monotonic() + 120
+        internet = False
+        while time.monotonic() < deadline:
+            internet = windows_setup.internet_available(timeout=2)
+            if internet and _mqtt_connected.is_set() and _robot_online.is_set():
+                _update_setup_state(
+                    state="success",
+                    step="连接完成",
+                    message="电脑网络、MQTT 和机器人均已恢复；无需重新烧录。",
+                    error="",
+                    completed_at=_now_iso(),
+                )
+                print(f"[设备向导] {setup_ssid} 已配置到 {target_ssid}，机器人重新上线。")
+                return
+            time.sleep(2)
+
+        if not internet:
+            reason = "电脑恢复原网络后仍无法访问互联网。"
+        elif not _mqtt_connected.is_set():
+            reason = "电脑可联网，但 MQTT 端口 1883 不可用；校园网或防火墙可能限制了该端口。"
+        else:
+            reason = "MQTT 已连接，但机器人未上线；请确认场地 Wi-Fi 提供 2.4 GHz 且密码正确。"
+        raise windows_setup.SetupError(reason)
+    except Exception as exc:
+        recovery_error = ""
+        if original and not restored:
+            try:
+                _restore_after_setup(original, setup_ssid)
+                restored = True
+            except Exception as restore_exc:
+                recovery_error = f"；电脑原网络自动恢复失败：{restore_exc}"
+        if setup_connected and original:
+            windows_setup.remove_setup_profile(setup_ssid, original.get("name", ""))
+        _update_setup_state(
+            state="error",
+            step="连接失败",
+            message="",
+            error=f"{exc}{recovery_error}",
+            completed_at=_now_iso(),
+        )
+        print(f"[设备向导失败] {exc}{recovery_error}")
+
+
 @app.route("/", methods=["GET"])
 def dashboard():
     return render_template("dashboard.html")
@@ -362,6 +514,7 @@ def dashboard():
 @app.route("/api/health", methods=["GET"])
 def health():
     recording_status = experiment_recorder.status()
+    microphone_status = current_microphone_status()
     with _cycle_lock:
         robot_busy = _robot_busy
     return jsonify(
@@ -371,7 +524,8 @@ def health():
             "mqtt_connected": _mqtt_connected.is_set(),
             "robot_online": _robot_online.is_set(),
             "robot_busy": robot_busy,
-            "microphones": sorted(_microphones),
+            "microphones": microphone_status["online_nodes"],
+            "audio_capture": microphone_status,
             "experiment_state": recording_status["state"],
             "default_output_dir": str(experiment_recorder.default_output_dir),
         }
@@ -532,11 +686,16 @@ def start_experiment_api():
         return jsonify(
             {"status": "error", "message": "--no-mic 模式不能开始正式录音。"}
         ), 409
-    if sorted(_microphones) != ["node1", "node2", "node3", "node4"]:
+    microphones = refresh_microphones(force=True)
+    if sorted(microphones) != ["node1", "node2", "node3", "node4"]:
+        scan_detail = f" 设备扫描失败：{_microphone_scan_error}" if _microphone_scan_error else ""
         return jsonify(
             {
                 "status": "error",
-                "message": f"只检测到 {len(_microphones)} 路麦克风，必须先接齐并命名 4 路设备。",
+                "message": (
+                    f"只检测到 {len(microphones)} 路麦克风，必须先接齐并命名 4 路设备。"
+                    f"{scan_detail}"
+                ),
             }
         ), 409
 
@@ -566,7 +725,7 @@ def start_experiment_api():
         recording = experiment_recorder.start(
             output_dir=output_dir or None,
             group_number=group_number,
-            nodes=sorted(_microphones),
+            nodes=sorted(microphones),
         )
         reset_runtime_state(
             archive_current=False,
@@ -783,6 +942,7 @@ def reset_session_api():
 
 @app.route("/api/get_meeting_data", methods=["GET"])
 def get_meeting_data():
+    microphone_status = current_microphone_status()
     with _cycle_lock:
         robot_busy = _robot_busy
         task_started_at = _robot_task_started_at
@@ -811,7 +971,8 @@ def get_meeting_data():
                 "mqtt_connected": _mqtt_connected.is_set(),
                 "robot_online": _robot_online.is_set(),
                 "next_schedule_check_at": next_check_at,
-                "microphones": sorted(_microphones),
+                "microphones": microphone_status["online_nodes"],
+                "audio_capture": microphone_status,
                 "experiment": experiment_recorder.status(),
                 "experiment_active": _experiment_active.is_set(),
                 "experiment_ending": _experiment_ending.is_set(),
@@ -920,23 +1081,202 @@ def find_renamed_microphones():
     return target_mics
 
 
+def refresh_microphones(force=False):
+    """Refresh the idle/start-time device map without probing active streams."""
+    global _microphones, _last_microphone_scan_monotonic, _microphone_scan_error
+
+    now = time.monotonic()
+    with _microphone_lock:
+        if (
+            not force
+            and _last_microphone_scan_monotonic
+            and now - _last_microphone_scan_monotonic < MICROPHONE_SCAN_INTERVAL_SECONDS
+        ):
+            return dict(_microphones)
+        try:
+            found = find_renamed_microphones()
+        except (OSError, RuntimeError, sd.PortAudioError) as exc:
+            _microphones = {}
+            _microphone_scan_error = str(exc)
+            _last_microphone_scan_monotonic = now
+            return {}
+        _microphones = found
+        _microphone_scan_error = ""
+        _last_microphone_scan_monotonic = now
+        return dict(_microphones)
+
+
+def current_microphone_status():
+    """Return physical devices while idle and callback-liveness while recording."""
+    expected = ["node1", "node2", "node3", "node4"]
+    if not _experiment_active.is_set():
+        devices = refresh_microphones()
+        online = sorted(devices)
+        return {
+            "online_nodes": online,
+            "missing_nodes": [node for node in expected if node not in devices],
+            "last_chunk_age_seconds": {},
+            "callback_errors": {},
+            "scan_error": _microphone_scan_error,
+        }
+
+    now = time.monotonic()
+    with _audio_health_lock:
+        last_chunks = dict(_audio_last_chunk_monotonic)
+        callback_errors = dict(_audio_callback_errors)
+    ages = {
+        node: round(max(0.0, now - timestamp), 3)
+        for node, timestamp in last_chunks.items()
+    }
+    online = sorted(
+        node
+        for node in expected
+        if node in ages and ages[node] <= AUDIO_CALLBACK_TIMEOUT_SECONDS
+    )
+    return {
+        "online_nodes": online,
+        "missing_nodes": [node for node in expected if node not in online],
+        "last_chunk_age_seconds": ages,
+        "callback_errors": callback_errors,
+        "scan_error": "",
+    }
+
+
+@app.route("/api/setup/status", methods=["GET"])
+def setup_status_api():
+    connectivity = _connectivity_snapshot()
+    microphone_status = current_microphone_status()
+    return jsonify(
+        {
+            "status": "success",
+            "platform_supported": sys.platform.startswith("win"),
+            "computer": {
+                "internet_available": connectivity["internet_available"],
+                "wifi_ssid": connectivity["wifi"].get("ssid", ""),
+                "wifi_band": connectivity["wifi"].get("band", ""),
+                "wifi_interface": connectivity["wifi"].get("name", ""),
+                "error": connectivity["error"],
+            },
+            "mqtt_connected": _mqtt_connected.is_set(),
+            "robot_online": _robot_online.is_set(),
+            "microphones": microphone_status["online_nodes"],
+            "provisioning": _setup_state_snapshot(),
+        }
+    )
+
+
+@app.route("/api/setup/networks", methods=["GET"])
+def setup_networks_api():
+    if not sys.platform.startswith("win"):
+        return jsonify({"status": "error", "message": "设备连接向导仅支持 Windows。"}), 409
+    if _setup_state_snapshot()["state"] in {
+        "connecting_setup", "sending_credentials", "restoring_network", "waiting_online"
+    }:
+        return jsonify({"status": "busy", "message": "设备连接流程正在进行，暂不能重新扫描。"}), 409
+    try:
+        networks = windows_setup.visible_networks()
+        connection = windows_setup.connected_wifi()
+    except windows_setup.SetupError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 500
+    return jsonify(
+        {
+            "status": "success",
+            "networks": networks,
+            "setup_hotspots": [
+                item for item in networks if item["ssid"].startswith("EffMeet-Setup-")
+            ],
+            "current_wifi": connection,
+        }
+    )
+
+
+@app.route("/api/setup/provision", methods=["POST"])
+def setup_provision_api():
+    global _setup_thread
+    if not sys.platform.startswith("win"):
+        return jsonify({"status": "error", "message": "设备连接向导仅支持 Windows。"}), 409
+    if _experiment_active.is_set():
+        return jsonify({"status": "error", "message": "实验正在录音，禁止切换电脑网络。"}), 409
+
+    body = request.get_json(silent=True) or {}
+    setup_ssid = str(body.get("setup_ssid") or "").strip()
+    target_ssid = str(body.get("target_ssid") or "").strip()
+    password = str(body.get("password") or "")
+    if not setup_ssid.startswith("EffMeet-Setup-") or len(setup_ssid) > 32:
+        return jsonify({"status": "error", "message": "请选择有效的 EffMeet-Setup-XXXX 热点。"}), 400
+    if not target_ssid or len(target_ssid) > 32 or len(password) > 63:
+        return jsonify({"status": "error", "message": "场地 Wi-Fi 名称或密码长度无效。"}), 400
+
+    try:
+        networks = windows_setup.visible_networks()
+    except windows_setup.SetupError as exc:
+        return jsonify({"status": "error", "message": f"扫描场地 Wi-Fi 失败：{exc}"}), 500
+    target_error = windows_setup.validate_target_network(networks, target_ssid)
+    if target_error:
+        return jsonify({"status": "error", "message": target_error}), 409
+
+    with _setup_state_lock:
+        if _setup_state["state"] in {
+            "connecting_setup", "sending_credentials", "restoring_network", "waiting_online"
+        }:
+            return jsonify({"status": "busy", "message": "已有设备连接流程正在进行。"}), 409
+        _setup_state.update(
+            state="starting",
+            step="准备连接",
+            message="正在保存电脑当前网络状态…",
+            error="",
+            setup_ssid=setup_ssid,
+            target_ssid=target_ssid,
+            original_ssid="",
+            current_ssid="",
+            started_at=_now_iso(),
+            completed_at="",
+        )
+    _setup_thread = threading.Thread(
+        target=_provision_robot_wifi,
+        args=(setup_ssid, target_ssid, password),
+        name="effmeet-device-setup",
+        daemon=True,
+    )
+    _setup_thread.start()
+    return jsonify(
+        {
+            "status": "accepted",
+            "message": "设备连接流程已开始；请保持本页面打开，电脑网络会短暂切换后自动恢复。",
+            "provisioning": _setup_state_snapshot(),
+        }
+    ), 202
+
+
 def start_audio_capture():
     global _audio_streams, _audio_workers_started
+    global _audio_last_chunk_monotonic, _audio_callback_errors
 
     with _stream_lock:
         if _audio_streams:
             raise RuntimeError("音频输入流已经启动，拒绝重复开始。")
 
         streams = []
+        with _audio_health_lock:
+            _audio_last_chunk_monotonic = {}
+            _audio_callback_errors = {}
         try:
             for node_name, device_index in sorted(_microphones.items()):
                 def cb(indata, frames, time_info, status, name=node_name):
-                    if status:
-                        print(f"[麦克风状态] {name}: {status}")
-                    audio_bytes = indata.copy().tobytes()
-                    captured_at_ns = time.time_ns()
-                    experiment_recorder.capture(name, audio_bytes, captured_at_ns)
-                    audio_queues[name].put(audio_bytes)
+                    try:
+                        if status:
+                            print(f"[麦克风状态] {name}: {status}")
+                        audio_bytes = indata.copy().tobytes()
+                        captured_at_ns = time.time_ns()
+                        experiment_recorder.capture(name, audio_bytes, captured_at_ns)
+                        audio_queues[name].put(audio_bytes)
+                        with _audio_health_lock:
+                            _audio_last_chunk_monotonic[name] = time.monotonic()
+                            _audio_callback_errors.pop(name, None)
+                    except Exception as exc:
+                        with _audio_health_lock:
+                            _audio_callback_errors[name] = str(exc)
+                        print(f"[麦克风回调错误] {name}: {exc}")
 
                 stream = sd.InputStream(
                     device=device_index,
@@ -952,6 +1292,25 @@ def start_audio_capture():
             for node_name, device_index, stream in streams:
                 stream.start()
                 print(f"[麦克风] {node_name} 正式开始录音，设备编号={device_index}")
+
+            deadline = time.monotonic() + AUDIO_START_TIMEOUT_SECONDS
+            expected = {"node1", "node2", "node3", "node4"}
+            while time.monotonic() < deadline:
+                with _audio_health_lock:
+                    started_nodes = set(_audio_last_chunk_monotonic)
+                    callback_errors = dict(_audio_callback_errors)
+                if started_nodes == expected:
+                    break
+                if callback_errors:
+                    raise RuntimeError(
+                        "麦克风回调启动失败："
+                        + "；".join(f"{node}={error}" for node, error in sorted(callback_errors.items()))
+                    )
+                time.sleep(0.05)
+            else:
+                missing = "、".join(sorted(expected - started_nodes))
+                raise RuntimeError(f"麦克风未在 {AUDIO_START_TIMEOUT_SECONDS:.0f} 秒内送回音频：{missing}")
+
             _audio_streams = [stream for _node, _device, stream in streams]
             if not _audio_workers_started:
                 threading.Thread(target=brain_worker, daemon=True).start()
@@ -1636,7 +1995,7 @@ def main():
         )
 
     reset_runtime_state()
-    _microphones = find_renamed_microphones()
+    _microphones = refresh_microphones(force=True)
     _no_mic_mode = bool(args.no_mic)
     print(f"[启动] 已检测到麦克风节点：{list(_microphones.keys())}")
 

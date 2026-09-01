@@ -43,6 +43,8 @@ class ExperimentRecorder:
     """Write all microphone blocks locally, then atomically export and verify them."""
 
     _STOP = object()
+    _MAX_MISSING_AUDIO_SECONDS = 2.0
+    _DIGITAL_SILENCE_MIN_SECONDS = 10.0
 
     def __init__(self, staging_root, sample_rate=16000, channels=1, sample_width=2):
         self.staging_root = Path(staging_root).resolve()
@@ -62,6 +64,7 @@ class ExperimentRecorder:
         self._frames = {}
         self._first_chunk_wall_ns = {}
         self._last_chunk_wall_ns = {}
+        self._has_nonzero_pcm = {}
         self._nodes = []
 
         self.experiment_id = None
@@ -163,6 +166,7 @@ class ExperimentRecorder:
             self._frames = {node: 0 for node in nodes}
             self._first_chunk_wall_ns = {node: None for node in nodes}
             self._last_chunk_wall_ns = {node: None for node in nodes}
+            self._has_nonzero_pcm = {node: False for node in nodes}
             self._nodes = nodes
 
             self.experiment_id = experiment_id
@@ -199,6 +203,8 @@ class ExperimentRecorder:
                 self._dropped_chunks += 1
                 self.last_error = f"{node} 收到不完整 PCM 帧。"
                 return False
+            if any(item[1]):
+                self._has_nonzero_pcm[node] = True
             try:
                 self._queue.put_nowait(item)
             except queue.Full:
@@ -265,8 +271,49 @@ class ExperimentRecorder:
                 self._state = "error"
                 self.last_error = f"检测到 {self._dropped_chunks} 个音频块丢失，拒绝标记为完整录音。"
                 raise RecordingError(self.last_error)
+            integrity_error = self._audio_integrity_error_locked()
+            if integrity_error:
+                self._state = "error"
+                self.last_error = integrity_error
+                raise RecordingError(self.last_error)
             self._state = "stopped"
         return self.status()
+
+    def _audio_integrity_error_locked(self):
+        durations = {
+            node: self._frames[node] / self.sample_rate
+            for node in self._nodes
+        }
+        empty_nodes = [node for node, frames in self._frames.items() if frames <= 0]
+        if empty_nodes:
+            return "以下麦克风没有录到任何音频：" + "、".join(sorted(empty_nodes))
+
+        shortest = min(durations.values())
+        longest = max(durations.values())
+        if longest - shortest > self._MAX_MISSING_AUDIO_SECONDS:
+            detail = "，".join(
+                f"{node}={seconds:.1f}s" for node, seconds in sorted(durations.items())
+            )
+            return f"四路录音时长不一致，疑似中途掉线：{detail}"
+
+        elapsed = 0.0
+        if self.started_monotonic_ns and self.ended_monotonic_ns:
+            elapsed = (self.ended_monotonic_ns - self.started_monotonic_ns) / 1_000_000_000
+        if elapsed - shortest > self._MAX_MISSING_AUDIO_SECONDS:
+            return (
+                f"四路录音均早于实验结束停止：实验 {elapsed:.1f}s，"
+                f"最短录音 {shortest:.1f}s"
+            )
+
+        silent_nodes = [
+            node
+            for node, seconds in durations.items()
+            if seconds >= self._DIGITAL_SILENCE_MIN_SECONDS
+            and not self._has_nonzero_pcm[node]
+        ]
+        if silent_nodes:
+            return "以下麦克风长时间只有数字静音：" + "、".join(sorted(silent_nodes))
+        return None
 
     def abort_failed_start(self, timeout=30):
         """Discard a session that never reached a successful explicit start response."""
@@ -324,6 +371,7 @@ class ExperimentRecorder:
             self._frames = {}
             self._first_chunk_wall_ns = {}
             self._last_chunk_wall_ns = {}
+            self._has_nonzero_pcm = {}
             self._nodes = []
             self.experiment_id = None
             self.group_number = None
