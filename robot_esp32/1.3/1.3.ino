@@ -326,28 +326,28 @@ void updateExpressionTimeout() {
 // ============================================================
 void rightForward(int spd) {
   digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
-  ledcWrite(0, spd);
+  ledcWrite(ENA, spd);
 }
 void rightBackward(int spd) {
   digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
-  ledcWrite(0, spd);
+  ledcWrite(ENA, spd);
 }
 void rightStop() {
   digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
-  ledcWrite(0, 0);
+  ledcWrite(ENA, 0);
 }
 
 void leftForward(int spd) {
   digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
-  ledcWrite(1, spd);
+  ledcWrite(ENB, spd);
 }
 void leftBackward(int spd) {
   digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
-  ledcWrite(1, spd);
+  ledcWrite(ENB, spd);
 }
 void leftStop() {
   digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
-  ledcWrite(1, 0);
+  ledcWrite(ENB, 0);
 }
 
 void motorsStop() { leftStop(); rightStop(); }
