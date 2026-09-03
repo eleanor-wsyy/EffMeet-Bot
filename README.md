@@ -2,7 +2,7 @@
 
 EffMeet-Bot 是一套面向 4 人会议实验的本地系统：Windows 电脑同时采集 4 路独立麦克风、累计每人的发言时长并判断是否需要干预；ESP32-S3 机器人通过 MQTT 接收任务，移动到对应座位并显示专注、提醒、好奇或稳定表情。
 
-当前版本：**EffMeet V1.1 / `v1.1.0`**
+当前版本：**EffMeet V1.1.1 / `v1.1.1`**
 下载地址：[GitHub Releases](https://github.com/eleanor-wsyy/EffMeet-Bot/releases/latest)
 
 > 部署提示：Release 便携版不需要 Python。运行源码时，必须先在目标电脑创建自己的 `cloud_brain/.venv`；不要复制本机的 `.venv`，也不要让脚本静默使用 Anaconda 或其他系统 Python。
