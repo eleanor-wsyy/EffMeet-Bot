@@ -1,0 +1,4 @@
+# 可选 AI 能力：不安装也不影响四路录音、robust 发言判定和 MQTT 干预。
+# faster-whisper 提供语音转写；torch 只用于 Silero VAD。
+faster-whisper>=1.0.0
+torch>=2.0.0

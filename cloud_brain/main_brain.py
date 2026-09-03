@@ -983,7 +983,7 @@ def get_meeting_data():
 
 def get_whisper_model():
     # 延迟加载 Whisper，避免导入模块时就下载/加载模型，方便排查启动问题。
-    # 注意：faster_whisper 依赖 torch，只在真正需要转写时才 import，被打包剥离。
+    # faster-whisper 与 Silero VAD 都是可选能力，只在真正需要时加载。
     global _whisper_model
     if _whisper_model is None:
         print("[启动] 正在加载 Faster-Whisper tiny 模型，请稍等...")
@@ -1416,8 +1416,21 @@ def schedule_backend_shutdown(delay_seconds=3):
 
 def whisper_worker():
     # 后台转写线程：把收集到的一段语音保存成临时 wav，再交给 Whisper 转文字。
+    global USE_WHISPER
     os.makedirs("temp_audio", exist_ok=True)
-    model = get_whisper_model()
+    try:
+        model = get_whisper_model()
+    except Exception as exc:
+        # 可选依赖、模型缓存或网络不可用时，保留核心录音/判定/干预能力。
+        USE_WHISPER = False
+        while True:
+            try:
+                transcribe_queue.get_nowait()
+                transcribe_queue.task_done()
+            except queue.Empty:
+                break
+        print(f"[转写] 未启用：{exc}。核心录音、发言判定和 MQTT 干预仍继续。")
+        return
 
     while True:
         session_generation, node_name, frames, max_db = transcribe_queue.get()
@@ -1440,6 +1453,8 @@ def whisper_worker():
                                 "decibel": round(float(max_db), 1),
                             }
                         )
+        except Exception as exc:
+            print(f"[转写] 当前片段失败，已跳过：{exc}")
         finally:
             try:
                 os.remove(temp_file)

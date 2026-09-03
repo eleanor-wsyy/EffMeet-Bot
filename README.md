@@ -5,12 +5,21 @@ EffMeet-Bot 是一套面向 4 人会议实验的本地系统：Windows 电脑同
 当前版本：**EffMeet V1.1 / `v1.1.0`**
 下载地址：[GitHub Releases](https://github.com/eleanor-wsyy/EffMeet-Bot/releases/latest)
 
+> 部署提示：Release 便携版不需要 Python。运行源码时，必须先在目标电脑创建自己的 `cloud_brain/.venv`；不要复制本机的 `.venv`，也不要让脚本静默使用 Anaconda 或其他系统 Python。
+
 ## 先记住四件事
 
 1. 双击“启动实验控制台”只会让后台进入就绪状态，**不会录音**。
 2. 只有 4 路麦克风、MQTT、机器人全部在线且机器人空闲时，才能正式开始。
 3. 一组实验必须有明确的 `START` 和 `END`；不能通过拔线或强制关闭后台代替结束。
 4. 只有看到 `EXPERIMENT ENDED AND VERIFIED`，并且最终目录自动打开，才算实验成功。
+
+## 部署前置检查
+
+- Windows 10/11 x64；源码部署需要 Python 3.10 或更高版本。
+- 4 只 USB 麦克风、固定集线器端口，以及管理员权限（首次改名时使用）。
+- 机器人网络为 2.4 GHz Wi-Fi，电脑可以访问 MQTT Broker 的 TCP 1883 端口。
+- 录音目标盘至少预留 2 GB；四路录音约每分钟 7.7 MB，收尾阶段会暂存和成品同时存在。
 
 ## 现场快速开始
 
@@ -221,7 +230,8 @@ EffMeet-Bot/
 │  ├─ windows_setup.py             # Windows Wi-Fi 配网与恢复
 │  ├─ main.py                      # 模块化备用入口
 │  ├─ config.yaml                  # 模块化入口配置
-│  ├─ requirements.txt             # 完整源码依赖
+│  ├─ requirements.txt             # 基础源码依赖（跨电脑部署）
+│  ├─ requirements-ml.txt          # 可选 Faster-Whisper / Silero VAD 依赖
 │  ├─ core/                        # 音频与人声判定
 │  ├─ logic/                       # 会议状态和干预逻辑
 │  ├─ network/                     # MQTT 封装
@@ -233,7 +243,8 @@ EffMeet-Bot/
 ├─ robot_esp32/
 │  └─ 1.3/                         # Arduino 草图；目录名必须与 1.3.ino 匹配
 ├─ EffMeet_App/                    # 已打包的 Windows 便携版
-├─ scripts/                        # 启动、结束和固件构建脚本
+├─ scripts/                        # 部署、启动、结束和固件构建脚本
+├─ 首次部署.bat                    # 为当前电脑创建 cloud_brain/.venv
 ├─ 启动实验控制台.bat
 ├─ 开始实验.bat
 ├─ 开始实验-仅麦克风.bat
@@ -256,18 +267,26 @@ EffMeet_App/
 └─ _internal/
 ```
 
-仓库中的 `cloud_brain/.venv` 只属于创建它的电脑，不能随压缩包复制到其他电脑运行。跨电脑使用应选择 Release 里的便携版，或在目标电脑重新创建虚拟环境。
+仓库中的 `cloud_brain/.venv` 只属于创建它的电脑，不能随压缩包复制到其他电脑运行。跨电脑使用有两种可靠方式：
+
+1. **便携版（推荐）**：完整解压 Release 的 `EffMeet_App/`，直接双击“启动实验控制台.bat”。
+2. **源码版**：在目标电脑双击“首次部署.bat”。脚本会检测 Python、创建本机 `cloud_brain/.venv` 并安装基础依赖；以后启动脚本只会使用这个虚拟环境。
 
 ### 源码运行
 
 ```powershell
+# 首次部署（也可以双击仓库根目录的“首次部署.bat”）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup_env.ps1
+
+# 可选：安装语音转写和 Silero VAD；不安装也不影响录音、发言判定和 MQTT 干预
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup_env.ps1 -WithMl
+
+# 直接使用本机虚拟环境启动
 cd cloud_brain
-python -m venv .venv
-.\.venv\Scripts\python -m pip install -r requirements.txt
-.\.venv\Scripts\python main_brain.py
+.\.venv\Scripts\python.exe main_brain.py
 ```
 
-手动启动 `main_brain.py` 后仍然只是就绪状态，必须在控制台或 API 中明确开始实验。
+如果缺少 `faster-whisper` 或 `torch`，程序会明确提示并降级：核心录音、robust 发言判定和 MQTT 干预继续工作，只有语音转写或 Silero VAD 不可用。手动启动 `main_brain.py` 后仍然只是就绪状态，必须在控制台或 API 中明确开始实验。
 
 ### 重新打包
 
